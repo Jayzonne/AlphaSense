@@ -1,0 +1,8 @@
+Logique serveur / API locale
+Connexion, gestion de sessions
+Infos profil, préférences, favoris
+Points d'entrée API 
+Accès à la base locale
+
+
+

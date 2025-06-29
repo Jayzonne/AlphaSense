@@ -1,0 +1,5 @@
+├── algorithms/                 ← Analyse technique / algos de signal
+│   ├── indicators/              ← RSI, MACD, Bollinger, etc.
+│   ├── patterns/                ← Détection de figures (double top, triangles...)
+│   ├── signals/                 ← Logique de décision (acheter/vendre)
+│   └── utils.py                 ← Fonctions de support pour les algos

@@ -1,0 +1,4 @@
+├── services/                    ← Interfaces internes entre modules
+│   ├── market_data_service.py   ← Unifie l'accès aux données
+│   ├── signal_engine.py         ← Centralise les décisions algo/IA
+│   └── user_service.py          ← Service utilisateur
