@@ -1,4 +1,4 @@
-from .api.get_alphavantage_api_data import AlphavantageAPI
+from .api.getAlphavantageApiData import AlphavantageAPI
 
 print("Initalizing AlphaSense")
 
