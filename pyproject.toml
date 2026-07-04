@@ -11,7 +11,7 @@ authors = [
 ]
 description = " See current stock state with patterns"
 readme = "README.md"
-requires-python = "=3.12"
+requires-python = ">=3.12,<3.13"
 classifier = [
 	"Programming Language :: Python :: 3",
 	"Operating System :: OS Independent"
