@@ -28,6 +28,10 @@ class GenericAPI(ABC):
     _interval_authorized_values: List
 
     @property
+    def interval_authorized_values(self) -> list[str]:
+        return self._interval_authorized_values
+
+    @property
     def interval(self) -> str:
         return self._interval
 

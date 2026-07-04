@@ -4,12 +4,6 @@ source .env
 
 # Create timescaledb shared folder
 mkdir -p ./data/timescaledb
-# Avoid crash of container on startup by giving correcto rights to timescaledb folder
-# (For podman users)
-if command -v podman &> /dev/null; then	
-	podman unshare chown -R 0:0 ./data 2>/dev/null
-	podman unshare chown -R 0:0 ./data/timescaledb 2>/dev/null
-fi
 echo "Starting up container"
 # Start container for TimeScaleDb
 docker compose up -d

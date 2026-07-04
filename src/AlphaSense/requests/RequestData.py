@@ -16,7 +16,7 @@ class RequestData():
     start_date -> date you want the requested data to start from, datetime format
     end_date -> date you want the requested data to end, datetime format
     interval -> interval between two stock point (string), avaiable:
-        1min, 5min, 15min, 30min, 60min
+    Depends on the data_source
     data_source -> One of the data source avaiable, current data sources are:
         YAHOO, ALPHAVANTAGE
     """
@@ -26,6 +26,7 @@ class RequestData():
     _interval = ""
     _data_source = ""
     _database_connection: psycopg2.extensions.connection
+    _api_data_class: GenericAPI
 
     def __init__(
             self,
@@ -35,12 +36,13 @@ class RequestData():
             interval: str,
             data_source="YAHOO"
     ):
-        self._action_symbol=action_symbol
+        self._action_symbol = action_symbol
         self._start_date = start_date
         self._end_date = end_date
         self._interval = interval
         self._data_source = data_source
         load_dotenv()
+        self._update_dataclass()
         self._database_connection = psycopg2.connect(
                 host="localhost",
                 port=5432,
@@ -48,6 +50,51 @@ class RequestData():
                 user="postgres",
                 password=os.getenv("POSTGRES_PASSWORD")
         )
+
+    def _update_dataclass(self) -> None:
+        interval_to_request = self._interval
+        interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
+        # Since requested interval is 60 min for somme API, if the requested interval is more than thatn
+        # Insert data with an interval of 60 min
+        if interval_in_min > 60:
+            interval_to_request = "60min"
+        match self._data_source:
+            case "YAHOO":
+                self._api_data_class = YahooAPI(
+                        self._start_date,
+                        self._end_date,
+                        interval_to_request,
+                        self._action_symbol
+                )
+            case "ALPHAVANTAGE":
+                self._api_data_class = AlphavantageAPI(
+                        self._start_date,
+                        self._end_date,
+                        interval_to_request,
+                        self._action_symbol
+                )
+            case _:
+                raise TypeError(
+                        "Data source does not exist, please see avaiable data sources")
+
+    def get_authorized_intervals(self) -> list[str]:
+        return self._api_data_class.interval_authorized_values
+
+    def set_action_symbol(self, action_symbol: str) -> None:
+        self._action_symbol = action_symbol
+
+    def set_start_date(self, start_date: datetime) -> None:
+        self._start_date = start_date
+
+    def set_end_date(self, end_date: datetime) -> None:
+        self._end_date = end_date
+
+    def set_interval(self, interval: str) -> None:
+        self._interval = interval
+
+    def set_data_source(self, data_source: str) -> None:
+        self._data_source = data_source
+        self._update_dataclass()
 
     def get_price_candles(self) -> list[dict]:
         """
@@ -59,6 +106,12 @@ class RequestData():
             json_data = self._request_data_from_api()
             self._insert_price_candles(json_data)
         return self._query_price_candle()
+
+    def get_price_candles_dataframe(self) -> pd.DataFrame:
+        df = pd.DataFrame(self.get_price_candles())
+        df["time"] = pd.to_datetime(df["time"])
+        df.set_index("time", inplace=True)
+        return df
 
     def _data_exists(self) -> bool:
         """
@@ -121,26 +174,8 @@ class RequestData():
         Request data from the selected data_source
         if data does not exist in database
         """
-        api_data_class: GenericAPI
-        match self._data_source:
-            case "YAHOO":
-                api_data_class = YahooAPI(
-                        self._start_date,
-                        self._end_date,
-                        self._interval,
-                        self._action_symbol
-                )
-            case "ALPHAVANTAGE":
-                api_data_class = AlphavantageAPI(
-                        self._start_date,
-                        self._end_date,
-                        self._interval,
-                        self._action_symbol
-                )
-            case _:
-                raise TypeError(
-                        "Data source does not exist, please see avaiable data sources")
-        json_data = api_data_class.get_standard_json()
+        self._update_dataclass()
+        json_data = self._api_data_class.get_standard_json()
         return json_data
 
     def _insert_price_candles(self, data: dict) -> None:

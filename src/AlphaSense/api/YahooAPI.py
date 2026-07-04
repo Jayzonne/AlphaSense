@@ -14,7 +14,7 @@ class YahooAPI(GenericAPI):
     start_date -> datetime format, month from which the data start
     end_date -> datetime format, month from which the data end (EXCLUDED)
     interval -> interval between two stock point (string), avaiable:
-        1min, 5min, 15min, 30min, 60min
+        1m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo
     action_symbol -> symbol of the stock action you want the data from
     """
 

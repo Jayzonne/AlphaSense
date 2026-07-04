@@ -7,3 +7,4 @@ urllib3==2.5.0
 yfinance==0.2.65
 psycopg-binary==2.9.11
 panda==0.3.1
+dash==4.1.0
