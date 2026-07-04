@@ -11,7 +11,8 @@ from zoneinfo import ZoneInfo
 
 class AlphavantageAPI(GenericAPI):
     """
-    AlphavantageAPI class
+    AlphavantageAPI class (Now unmaintained, since they only do TimeSeries with
+    Premium subscription)
     Allow requesting alphavantage API to get intraday historical information
     between two months
     We are not responsible for API limits, if issues are present, please by an
@@ -55,6 +56,7 @@ class AlphavantageAPI(GenericAPI):
 &month={requested_month}\
 &outputsize=full\
 &adjusted=false\
+&extended_hours=false\
 &apikey={self._api_token}"
             request_result = requests.get(request_url)
             month_data = request_result.json()
@@ -66,6 +68,9 @@ class AlphavantageAPI(GenericAPI):
         json_api_data = self.get_json_api()
         request_month_list = []
         full_data_list = {}
+
+        # Get list of month requested in order to agregate the data in
+        # a single dictionnary
         for month_to_request in rrule.rrule(
             rrule.MONTHLY, dtstart=self._start_date, until=self._end_date
         ):
@@ -73,34 +78,47 @@ class AlphavantageAPI(GenericAPI):
                 f"{str(month_to_request.year)}-\
 {str(month_to_request.month).zfill(2)}"
             )
+        # Get Time Series string to extract data from this dictionnary entry
         time_series_string = f"Time Series ({self.interval})"
         key_eastern_timezone_list = []
+        # Get origin timezone for UTC conversion
+        try:
+            origin_timezone = json_api_data[request_month_list[0]]["Meta Data"][
+                "6. Time Zone"
+            ]
+        except Exception:
+            raise Exception("Json data is invalid, verify your dates and verify that you API key is valid")
         for month in request_month_list:
             full_data_list.update(json_api_data[month][time_series_string])
+        # Replace old dictionnary keys with new one
         for key in full_data_list:
             key_eastern_timezone_list.append(key)
-            full_data_list[key][f"('Open', '{self._action_symbol}')"] = full_data_list[
+            full_data_list[key]["Open"] = full_data_list[
                 key
             ].pop("1. open")
-            full_data_list[key][f"('Close', '{self._action_symbol}')"] = full_data_list[
+            full_data_list[key]["Close"] = full_data_list[
                 key
             ].pop("4. close")
-            full_data_list[key][f"('High', '{self._action_symbol}')"] = full_data_list[
+            full_data_list[key]["High"] = full_data_list[
                 key
             ].pop("2. high")
-            full_data_list[key][f"('Low', '{self._action_symbol}')"] = full_data_list[
+            full_data_list[key]["Low"] = full_data_list[
                 key
             ].pop("3. low")
-            full_data_list[key][f"('Volume', '{self._action_symbol}')"] = (
+            full_data_list[key]["Volume"] = (
                 full_data_list[key].pop("5. volume")
             )
+        # Convert hours into UTC
         for key_date in key_eastern_timezone_list:
             converted_key = (
                 datetime.fromisoformat(key_date)
-                .replace(tzinfo=ZoneInfo("America/New_York"))
+                .replace(tzinfo=ZoneInfo(origin_timezone))
                 .astimezone(ZoneInfo("UTC"))
             )
             full_data_list[converted_key.strftime("%Y-%m-%d %H:%M:%S")] = (
                 full_data_list.pop(key_date)
             )
-        return full_data_list
+        full_data_list_with_symbol = {}
+        full_data_list_with_symbol["symbol"] = self._action_symbol
+        full_data_list_with_symbol["data"] = full_data_list
+        return full_data_list_with_symbol

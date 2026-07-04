@@ -4,6 +4,8 @@ import yfinance as yf
 from datetime import datetime
 from typing import Dict
 import json
+import ast
+
 
 class YahooAPI(GenericAPI):
     """
@@ -40,11 +42,11 @@ class YahooAPI(GenericAPI):
                                             ]
         self._start_date = start_date
         self._end_date = end_date
-        self.interval = interval
-        self.action_symbol = action_symbol
+        self._interval = interval
+        self._action_symbol = action_symbol
 
     def get_json_api(self) -> Dict:
-        data = yf.download(self.action_symbol,
+        data = yf.download(self._action_symbol,
                            interval=self.interval,
                            start=f"{str(self._start_date.year)}-\
 {str(self._start_date.month).zfill(2)}-\
@@ -61,4 +63,16 @@ class YahooAPI(GenericAPI):
                 data.to_json(orient="index") or "{}")
 
     def get_standard_json(self) -> Dict:
-        return self.get_json_api()
+        json_api_data = self.get_json_api()
+        json_api_data_formated = {}
+        for date, data in json_api_data.items():
+            new_data = {}
+            for tag, value in data.items():
+                tag_tuple = ast.literal_eval(tag)
+                new_data[tag_tuple[0].lower()] = value
+            json_api_data_formated[date] = new_data
+        json_api_data_with_symbol = {}
+        json_api_data_with_symbol["symbol"] = self._action_symbol
+        json_api_data_with_symbol["data"] = json_api_data_formated
+
+        return json_api_data_with_symbol
