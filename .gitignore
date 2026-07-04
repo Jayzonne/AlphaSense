@@ -370,4 +370,8 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+# Project specific/Pyenv files
+lib64
+bin/
+pyvenv.cfg
 # End of https://www.toptal.com/developers/gitignore/api/python,node,linux,archlinuxpackages,windows

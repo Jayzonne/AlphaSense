@@ -1,8 +1,9 @@
 from .GenericAPI import GenericAPI
+import pandas as pd
 import yfinance as yf
 from datetime import datetime
 from typing import Dict
-
+import json
 
 class YahooAPI(GenericAPI):
     """
@@ -55,4 +56,9 @@ class YahooAPI(GenericAPI):
         if data is None:
             raise ValueError("Error when requesting yahoo API, \
                     resulting data is empty")
-        return data.to_dict()
+        data.index = pd.to_datetime(data.index).strftime("%Y-%m-%d %H:%M:%S")
+        return json.loads(
+                data.to_json(orient="index") or "{}")
+
+    def get_standard_json(self) -> Dict:
+        return self.get_json_api()

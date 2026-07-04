@@ -50,3 +50,14 @@ class GenericAPI(ABC):
         """
 
         pass
+
+    @abstractmethod
+    def get_standard_json(self) -> Dict:
+        """
+        This function will return the get_json_api under a
+        standardize format for all API for easier database
+        feed. This format as been choosen as the yahoo api
+        format
+        """
+
+        pass
