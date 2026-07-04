@@ -13,6 +13,7 @@ class RequestData():
     RequestData
     Class to Easily request data from any of the datasource with a single entry point
     This class also add every requested data to the TimeScaleDB database
+    action_symbol -> symbol of the stock action you want the data from
     start_date -> date you want the requested data to start from, datetime format
     end_date -> date you want the requested data to end, datetime format
     interval -> interval between two stock point (string), avaiable:
@@ -124,7 +125,7 @@ class RequestData():
         with self._database_connection.cursor() as cur:
             interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
             cur.execute("""
-                SELECT AVG(diff) FROM (
+                SELECT MODE() WITHIN GROUP (ORDER BY diff) FROM (
                     SELECT EXTRACT(EPOCH FROM (time - LAG(time) OVER (ORDER BY time))) / 60 as diff
                     FROM price_candles
                     WHERE symbol = %s

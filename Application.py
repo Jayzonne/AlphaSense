@@ -1,9 +1,10 @@
-from dash import Dash, html, dcc, callback, Input, Output, State
+from dash import Dash, html, dcc, callback, Input, Output, State, dash_table, no_update, Patch
 import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime, timedelta
 
 from AlphaSense.requests.RequestData import RequestData
+from AlphaSense.requests.candle_patterns import *
 
 DEFAULT_SYMBOL = "AAPL"
 DEFAULT_INTERVAL = "5m"
@@ -40,23 +41,56 @@ app.layout = html.Div([
             ),
         ]),
         html.Div([
-            dcc.Graph(id="candle-chart", style={"flex": "1", "width": "100%"}, config={"responsive": True}),
             html.Div([
+                dcc.Graph(
+                    id="candle-chart",
+                    style={"width": "100%", 'height':"600px"},
+                    config={"responsive": True}
+                ),
                 dcc.RangeSlider(
-                    id="y-axis-slider",
-                    vertical=True,
-                    verticalHeight=600,
-                    step=0.1,
-                    min=0,
-                    max=100,
-                    value=[0, 100],
-                    allowCross=False,
-                    tooltip={"placement": "left", "always_visible": True}
-                )
-                ], style={"width": "5%", "flexShrink": "0"})
-        ], style={"display": "flex", "alignItems": "center", "width": "100%"})
-])
+                        id="y-axis-slider",
+                        vertical=True,
+                        verticalHeight=600,
+                        step=0.1,
+                        min=0,
+                        max=100,
+                        value=[0, 100],
+                        allowCross=False,
+                        tooltip={"placement": "left", "always_visible": True}
+                    )
+                ], style={"display": "grid", "gridTemplateColumns": "1fr 60px", "alignItems": "center", "width": "100%", "gap":"10px"}),
 
+
+            dash_table.DataTable(
+                id="pattern-table",
+                columns=[
+                    {"name": "Time", "id": "time"},
+                    {"name": "Pattern", "id": "pattern"},
+                    {"name": "Direction", "id": "direction"},
+                ],
+                data=[],
+                sort_action="none",
+                filter_action="none",
+                page_action="none",
+                style_cell={"textAlign": "left"},
+                style_data_conditional=[
+                    {"if": {"filter_query": "{direction} = 'Bullish'"}, "backgroundColor": "#d4f7d4"},
+                    {"if": {"filter_query": "{direction} = 'Bearish'"}, "backgroundColor": "#f7d4d4"},
+                ],
+                style_table={"width": "100%", "overflowY": "auto", "maxHeight": "400px"}
+            )
+            ], style={"display": "flex", "flexDirection": "column", "width": "100%", "gap": "20px"}),
+
+        html.Div([
+            html.Label("Patterns to detect:"),
+            dcc.Checklist(
+                id="pattern-checklist",
+                options=[{"label": v["label"], "value":k} for k, v in PATTERN_REGISTRY.items()],
+                value=[],
+                inline=True
+            )
+        ])
+])
 
 # dcc.Dropdown(id="interval-select"),
 # @callback(
@@ -82,6 +116,7 @@ def update_chart(symbol, interval, start_date, end_date, y_range):
     try:
         request_data.set_action_symbol(symbol.upper())
         request_data.set_interval(interval)
+        print(interval)
         request_data.set_start_date(pd.to_datetime(start_date))
         request_data.set_end_date(pd.to_datetime(end_date))
         df_candles = request_data.get_price_candles_dataframe()
@@ -133,6 +168,63 @@ def update_slider_bounds(symbol, interval, start_date, end_date):
     y_max = df_candles["high"].max()
     return y_min, y_max, [y_min, y_max]
 
+@callback(
+    Output("pattern-table", "data"),
+    Input("symbol-input", "value"),
+    Input("interval-select", "value"),
+    Input("date-range", "start_date"),
+    Input("date-range", "end_date"),
+    Input("pattern-checklist", "value")
+)
+def update_pattern_table(symbol, interval, start_date, end_date, selected_patterns):
+    if not symbol or not selected_patterns:
+        return []
+
+    start = pd.to_datetime(start_date)
+    end = pd.to_datetime(end_date)
+    interval_minutes = pd.Timedelta(interval).total_seconds() / 60
+
+    rows = []
+    for key in selected_patterns:
+        entry = PATTERN_REGISTRY[key]
+        try:
+            instances = entry["class"](symbol.upper(), start, end, interval).get_pattern()
+        except Exception:
+            continue
+
+        for candle in instances:
+            if "time" not in candle:
+                continue
+            rows.append({
+                "time": pd.Timestamp(candle["time"]).isoformat(),
+                "pattern": entry["label"],
+                "direction": entry["direction"],
+                "interval_minutes": interval_minutes,
+            })
+    rows.sort(key=lambda r: r["time"])
+    return rows
+
+def _highlight_patch(row: dict) -> Patch:
+    center = pd.to_datetime(row["time"])
+    half_width = pd.Timedelta(minutes=row["interval_minutes"]) / 2
+    patched_fig = Patch()
+    patched_fig["layout"]["shapes"] = [dict(
+        type="rect", xref="x", yref="paper",
+        x0=(center - half_width).isoformat(), x1=(center + half_width).isoformat(),
+        y0=0, y1=1, fillcolor="rgba(255,125,0,0.35)", line_width=0
+    )]
+    return patched_fig
+
+@callback(
+        Output("candle-chart","figure", allow_duplicate=True),
+        Input("pattern-table", "active_cell"),
+        State("pattern-table","data"),
+        prevent_initial_call=True
+)
+def highlight_on_click(active_cell, table_data):
+    if not active_cell or not table_data:
+        return no_update
+    return _highlight_patch(table_data[active_cell["row"]])
 
 def get_range_breaks(df: pd.DataFrame, interval: str) -> list[dict]:
     """
