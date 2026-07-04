@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling >= 1.26 "]
+build-backend = "hatchling.build"
+
+[project]
+name = "AlphaSense"
+version = "0.1"
+authors = [
+	{ name="BenoitGui" },
+	{ name="Jayzonne" } 
+]
+description = " See current stock state with patterns"
+readme = "README.md"
+requires-python = "=3.12"
+classifier = [
+	"Programming Language :: Python :: 3",
+	"Operating System :: OS Independent"
+]
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.urls]
+Homepage = "https://github.com/Jayzonne/AlphaSense"
+Issues = "https://github.com/Jayzonne/AlphaSense/issues"
+
