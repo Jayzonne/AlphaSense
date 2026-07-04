@@ -82,15 +82,19 @@ class RequestData():
 
     def set_action_symbol(self, action_symbol: str) -> None:
         self._action_symbol = action_symbol
+        self._update_dataclass()
 
     def set_start_date(self, start_date: datetime) -> None:
         self._start_date = start_date
+        self._update_dataclass()
 
     def set_end_date(self, end_date: datetime) -> None:
         self._end_date = end_date
+        self._update_dataclass()
 
     def set_interval(self, interval: str) -> None:
         self._interval = interval
+        self._update_dataclass()
 
     def set_data_source(self, data_source: str) -> None:
         self._data_source = data_source

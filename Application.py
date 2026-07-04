@@ -16,7 +16,7 @@ request_data = RequestData(DEFAULT_SYMBOL,
                            DEFAULT_END_DATE,
                            DEFAULT_INTERVAL
                            )
-app.layout = [
+app.layout = html.Div([
         html.H1("AlphaSense Dashboard"),
 
         html.Div([
@@ -38,16 +38,25 @@ app.layout = [
                 start_date=DEFAULT_START_DATE,
                 end_date=DEFAULT_END_DATE
             ),
-            dcc.RadioItems(
-                id="scale-select",
-                options=[{"label": "Linear", "value": "linear"},
-                         {"label": "Log", "value": "log"}],
-                value="linear"
-            )
         ]),
+        html.Div([
+            dcc.Graph(id="candle-chart", style={"flex": "1", "width": "100%"}, config={"responsive": True}),
+            html.Div([
+                dcc.RangeSlider(
+                    id="y-axis-slider",
+                    vertical=True,
+                    verticalHeight=600,
+                    step=0.1,
+                    min=0,
+                    max=100,
+                    value=[0, 100],
+                    allowCross=False,
+                    tooltip={"placement": "left", "always_visible": True}
+                )
+                ], style={"width": "5%", "flexShrink": "0"})
+        ], style={"display": "flex", "alignItems": "center", "width": "100%"})
+])
 
-        dcc.Graph(id="candle-chart")
-]
 
 # dcc.Dropdown(id="interval-select"),
 # @callback(
@@ -65,9 +74,9 @@ app.layout = [
     Input("interval-select", "value"),
     Input("date-range", "start_date"),
     Input("date-range", "end_date"),
-    Input("scale-select", "value")
+    Input("y-axis-slider", "value")
 )
-def update_chart(symbol, interval, start_date, end_date, scale):
+def update_chart(symbol, interval, start_date, end_date, y_range):
     if not symbol:
         return go.Figure(), ""
     try:
@@ -86,16 +95,43 @@ def update_chart(symbol, interval, start_date, end_date, scale):
             low=df_candles["low"],
             close=df_candles["close"]
         )])
-
+        y_min = y_range[0] if y_range else df_candles["low"].min
+        y_max = y_range[1] if y_range else df_candles["high"].max
         fig.update_layout(
                 title=f"{symbol.upper()} - {interval}",
-                yaxis_type=scale,
+                yaxis=dict(range=[y_min, y_max]),
                 xaxis_rangeslider_visible=True,
                 xaxis=dict(rangebreaks=get_range_breaks(df_candles, interval))
         )
         return fig, ""
     except Exception as e:
         return go.Figure(), f"Error fetching data for '{symbol.upper()}': {str(e)}"
+
+
+@callback(
+        Output("y-axis-slider", "min"),
+        Output("y-axis-slider", "max"),
+        Output("y-axis-slider", "value"),
+        Input("symbol-input", "value"),
+        Input("interval-select", "value"),
+        Input("date-range", "start_date"),
+        Input("date-range", "end_date")
+)
+def update_slider_bounds(symbol, interval, start_date, end_date):
+    if not symbol:
+        return 0, 100, [0, 100]
+    request_data.set_action_symbol(symbol.upper())
+    request_data.set_interval(interval)
+    request_data.set_start_date(pd.to_datetime(start_date))
+    request_data.set_end_date(pd.to_datetime(end_date))
+    df_candles = request_data.get_price_candles_dataframe()
+
+    if df_candles.empty:
+        return 0, 100, [0, 100]
+
+    y_min = df_candles["low"].min()
+    y_max = df_candles["high"].max()
+    return y_min, y_max, [y_min, y_max]
 
 
 def get_range_breaks(df: pd.DataFrame, interval: str) -> list[dict]:
@@ -115,7 +151,6 @@ def get_range_breaks(df: pd.DataFrame, interval: str) -> list[dict]:
     if not isinstance(normal_interval, pd.Timedelta):
         raise ValueError(f"Invalid interval: {interval_in_min}")
     gaps = diffs.loc[diffs > normal_interval * 2]
-    print(gaps)
     range_breaks = []
     for timestamp, gap in gaps.items():
         gap_start = timestamp - gap
@@ -123,7 +158,6 @@ def get_range_breaks(df: pd.DataFrame, interval: str) -> list[dict]:
         range_breaks.append(dict(
             bounds=[gap_start.isoformat(), gap_end.isoformat()]
         ))
-    print(range_breaks)
     return range_breaks
 
 
