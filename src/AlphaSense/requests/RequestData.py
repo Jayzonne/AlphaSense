@@ -58,7 +58,7 @@ class RequestData():
         # Since requested interval is 60 min for somme API, if the requested interval is more than thatn
         # Insert data with an interval of 60 min
         if interval_in_min > 60:
-            interval_to_request = "60min"
+            interval_to_request = "60m"
         match self._data_source:
             case "YAHOO":
                 self._api_data_class = YahooAPI(
@@ -68,6 +68,8 @@ class RequestData():
                         self._action_symbol
                 )
             case "ALPHAVANTAGE":
+                if interval_to_request == "60m":
+                    interval_to_request = "60min"
                 self._api_data_class = AlphavantageAPI(
                         self._start_date,
                         self._end_date,
@@ -110,6 +112,7 @@ class RequestData():
         if not self._data_exists():
             json_data = self._request_data_from_api()
             self._insert_price_candles(json_data)
+            self._mark_closed_days(json_data)
         return self._query_price_candle()
 
     def get_price_candles_dataframe(self) -> pd.DataFrame:
@@ -125,19 +128,30 @@ class RequestData():
         with self._database_connection.cursor() as cur:
             interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
             cur.execute("""
-                SELECT MODE() WITHIN GROUP (ORDER BY diff) FROM (
-                    SELECT EXTRACT(EPOCH FROM (time - LAG(time) OVER (ORDER BY time))) / 60 as diff
+                SELECT day, MODE() WITHIN GROUP (ORDER BY diff) AS modal_diff FROM (
+                    SELECT 
+                        date_trunc('day', time) AS day,
+                        EXTRACT(EPOCH FROM (
+                                time - LAG(time) OVER (PARTITION BY date_trunc('day',time) ORDER BY time)
+                        )) / 60 AS diff
                     FROM price_candles
                     WHERE symbol = %s
-                    AND time >= %s
-                    AND time <= %s
+                    AND time BETWEEN %s AND %s
                 ) diffs
                 WHERE diff IS NOT NULL
+                GROUP BY day
             """, (self._action_symbol, self._start_date, self._end_date))
-            result = cur.fetchone()
-            if result is None:
+            result = cur.fetchall()
+            if not result:
                 return False
-            return result[0] is not None and round(result[0]) <= interval_in_min
+            if not all(modal_diff <= interval_in_min for _, modal_diff in result):
+                return False
+            existing_days = {day.date() for day, _ in result}
+            closed_days = self._get_closed_days()
+            expected_days = {
+                    d.date() for d in pd.bdate_range(self._start_date, self._end_date)
+            } - closed_days
+            return expected_days.issubset(existing_days)
 
     def _query_price_candle(self) -> list[dict]:
         """
@@ -183,6 +197,41 @@ class RequestData():
         json_data = self._api_data_class.get_standard_json()
         return json_data
 
+    def _mark_closed_days(self, json_data: dict) -> None:
+        """
+        Compare every business day in the requested range agaist the days the API
+        actually returned data for. Any business day with zero candles gets recorded
+        as closed for this symbol, so future requests stop excpecting data there.
+        """
+        returned_days = {pd.Timestamp(ts).date() for ts  in json_data["data"].keys()}
+        if not returned_days:
+            return # empty - response - Could be an error or every requested days are open
+
+        today = datetime.now().date()
+        expected_days = {
+                d.date() for d in pd.bdate_range(self._start_date, self._end_date)
+                if d.date() < today # Do not mark today / future day as closed market
+        }
+        closed_days = expected_days - returned_days
+        if not closed_days:
+            return
+        
+        with self._database_connection.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO closed_market_days (symbol, day)
+                VALUES %s
+                ON CONFLICT DO NOTHING
+            """, [(self._action_symbol, day) for day in closed_days])
+            self._database_connection.commit()
+
+    def _get_closed_days(self) -> set:
+        with self._database_connection.cursor() as cur:
+            cur.execute("""
+                SELECT day FROM closed_market_days
+                WHERE symbol = %s AND day BETWEEN %s AND %s
+            """, (self._action_symbol, self._start_date.date(), self._end_date.date()))
+            return {row[0] for row in cur.fetchall()}
+    
     def _insert_price_candles(self, data: dict) -> None:
         symbol = data["symbol"]
         rows = [

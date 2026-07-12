@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS price_candles (
 	volume      BIGINT           NOT NULL,
 	UNIQUE (time, symbol)
 );
+CREATE TABLE IF NOT EXISTS closed_market_days (
+	symbol TEXT NOT NULL,
+	day DATE NOT NULL,
+	PRIMARY KEY (symbol, day)
+);
 
 SELECT create_hypertable('price_candles', 'time', if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS price_candles_symbol_time ON price_candles (symbol, time DESC);
