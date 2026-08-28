@@ -136,7 +136,7 @@ class RequestData():
                         )) / 60 AS diff
                     FROM price_candles
                     WHERE symbol = %s
-                    AND time BETWEEN %s AND %s
+                    AND time >= %s AND time < %s
                 ) diffs
                 WHERE diff IS NOT NULL
                 GROUP BY day
@@ -170,7 +170,7 @@ class RequestData():
                     SUM(volume)       AS volume
                 FROM price_candles
                 WHERE symbol = %s
-                AND time BETWEEN %s and %s
+                AND time >= %s and time < %s
                 GROUP BY bucket, symbol
                 ORDER BY bucket ASC
             """, (f"{interval_in_min} minutes",
@@ -228,7 +228,7 @@ class RequestData():
         with self._database_connection.cursor() as cur:
             cur.execute("""
                 SELECT day FROM closed_market_days
-                WHERE symbol = %s AND day BETWEEN %s AND %s
+                WHERE symbol = %s AND day >= %s AND day < %s
             """, (self._action_symbol, self._start_date.date(), self._end_date.date()))
             return {row[0] for row in cur.fetchall()}
     

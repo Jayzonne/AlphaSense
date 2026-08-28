@@ -27,8 +27,12 @@ class RequestCandlePatterns(ABC):
             end_date: datetime,
             interval: str,
             data_source="YAHOO",
+            price_data: list[dict] | None = None,
             ):
-        self._data_request = RequestData(
+        if price_data is not None:
+            self._data_request = price_data
+        else:
+            self._data_request = RequestData(
                action_symbol,
                start_date,
                end_date,
