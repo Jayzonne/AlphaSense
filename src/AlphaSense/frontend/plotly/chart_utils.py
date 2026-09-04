@@ -66,8 +66,30 @@ def build_highlight_patch(row: dict) -> Patch:
     )]
     return patched_fig
 
+def _resolve_indicator(key: str, entry: dict, df: pd.DataFrame, symbol: str, interval: str,
+                        precomputed: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Reuses the indicator values already computed by compute_confluence() for
+    this exact df when available, instead of paying for _compute() a second
+    time. compute_confluence() always evaluates every indicator regardless of
+    what's toggled visible, so a precomputed frame is normally available for
+    every key here.
+
+    Falls back to computing directly only when there's no usable match - e.g.
+    Dash re-firing this callback a beat before confluence-store has caught up
+    to a just-changed symbol/date-range, where reusing the stale entry would
+    silently show indicator values for the wrong data.
+    """
+    computed = precomputed.get(key)
+    if computed is not None and not computed.empty and computed.index.equals(df.index):
+        return computed
+    return entry["class"](symbol, df.index.min(), df.index.max(), interval, price_data=df)._compute(df)
+
+
 def build_figure(df: pd.DataFrame, symbol: str, interval: str, y_min: float, y_max: float,
-                  selected_indicators: list[str], confluence: dict, threshold: int) -> go.Figure:
+                  selected_indicators: list[str], confluence: dict, threshold: int,
+                  precomputed_indicators: dict[str, pd.DataFrame] | None = None) -> go.Figure:
+    precomputed_indicators = precomputed_indicators or {}
     interval_minutes = to_minutes(interval)
     overlay_keys = [k for k in selected_indicators if INDICATOR_REGISTRY[k]["display"] == "overlay"]
     subplot_keys = [k for k in selected_indicators if INDICATOR_REGISTRY[k]["display"] == "subplot"]
@@ -80,14 +102,14 @@ def build_figure(df: pd.DataFrame, symbol: str, interval: str, y_min: float, y_m
 
     for key in overlay_keys:
         entry = INDICATOR_REGISTRY[key]
-        computed = entry["class"](symbol, df.index.min(), df.index.max(), interval, price_data=df)._compute(df)
+        computed = _resolve_indicator(key, entry, df, symbol, interval, precomputed_indicators)
         for col in entry["columns"]:
             fig.add_trace(go.Scatter(x=df.index, y=computed[col], name=f"{entry['label']} ({col})",
                                       line=dict(width=1)), row=1, col=1)
 
     for i, key in enumerate(subplot_keys, start=2):
         entry = INDICATOR_REGISTRY[key]
-        computed = entry["class"](symbol, df.index.min(), df.index.max(), interval, price_data=df)._compute(df)
+        computed = _resolve_indicator(key, entry, df, symbol, interval, precomputed_indicators)
         for col in entry["columns"]:
             fig.add_trace(go.Scatter(x=df.index, y=computed[col], name=f"{entry['label']} ({col})"), row=i, col=1)
         if "y_range" in entry:

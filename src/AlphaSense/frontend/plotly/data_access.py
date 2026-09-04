@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from datetime import datetime
 from AlphaSense.requests.RequestData import RequestData
@@ -30,6 +31,32 @@ def get_authorized_intervals(data_source: str = "YAHOO") -> list[str]:
     """
     probe = RequestData("AAPL", datetime.now(), datetime.now(), "1d", data_source)
     return probe.get_authorized_intervals()
+
+
+def dataframe_to_records(df: pd.DataFrame) -> list[dict]:
+    """
+    Serializes a time-indexed DataFrame into plain dicts so it can be handed
+    to a dcc.Store (which round-trips through JSON in the browser). NaN is
+    swapped for None first: Python's json encoder emits NaN as a bare `NaN`
+    token, which is not valid JSON and makes the browser's JSON.parse throw.
+    """
+    if df.empty:
+        return []
+    safe = df.replace({np.nan: None})
+    records = safe.reset_index().to_dict("records")
+    for r in records:
+        r["time"] = pd.Timestamp(r["time"]).isoformat()
+    return records
+
+
+def dataframe_from_records(records: list[dict] | None) -> pd.DataFrame:
+    """ Inverse of dataframe_to_records(). """
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    df["time"] = pd.to_datetime(df["time"])
+    df.set_index("time", inplace=True)
+    return df
 
 
 def to_minutes(interval: str) -> float:

@@ -9,14 +9,21 @@ def compute_confluence(symbol: str, start: datetime, end: datetime, interval: st
     For every candle in [start, end], counts how many indicators AND candle
     patterns signal Bullish vs Bearish. Always evaluates every registered
     indicator/pattern, independent of what's toggled visible in the UI.
+
+    Also hands back the raw per-indicator `_compute()` output (indicator_values),
+    keyed the same way as INDICATOR_REGISTRY. Since every indicator is computed
+    here regardless of visibility, the chart can reuse these values for whichever
+    indicators the user has toggled on instead of computing them a second time.
     """
     confluence: dict[str, dict] = {}
+    indicator_values: dict[str, pd.DataFrame] = {}
 
-    for entry in INDICATOR_REGISTRY.values():
+    for key, entry in INDICATOR_REGISTRY.items():
         instance = entry["class"](symbol, start, end, interval, price_data=price_data)
         if instance._df.empty:
             continue
         computed = instance._compute(instance._df)
+        indicator_values[key] = computed
         signal = instance._signal(instance._df, computed)
         for ts, label in signal.items():
             if label == "Neutral":
@@ -39,9 +46,12 @@ def compute_confluence(symbol: str, start: datetime, end: datetime, interval: st
             record["bullish" if entry["direction"] == "Bullish" else "bearish"].append(entry["label"])
 
     return {
-        ts: {
-            "bullish_count": len(r["bullish"]), "bearish_count": len(r["bearish"]),
-            "bullish_sources": r["bullish"], "bearish_sources": r["bearish"],
-        }
-        for ts, r in confluence.items()
+        "confluence": {
+            ts: {
+                "bullish_count": len(r["bullish"]), "bearish_count": len(r["bearish"]),
+                "bullish_sources": r["bullish"], "bearish_sources": r["bearish"],
+            }
+            for ts, r in confluence.items()
+        },
+        "indicator_values": indicator_values,
     }

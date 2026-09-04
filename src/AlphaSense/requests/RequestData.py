@@ -1,11 +1,45 @@
 from datetime import datetime
+import threading
 
 from psycopg2.extras import execute_values
+from psycopg2.pool import ThreadedConnectionPool
 from AlphaSense.api import *
 from dotenv import load_dotenv
 import psycopg2
 import os
 import pandas as pd
+
+
+_connection_pool: ThreadedConnectionPool | None = None
+_connection_pool_lock = threading.Lock()
+
+
+def _get_connection_pool() -> ThreadedConnectionPool:
+    """
+    Lazily builds one shared pool of Postgres connections for every RequestData
+    instance in the process, instead of each instance paying for its own
+    psycopg2.connect() (fresh TCP handshake + auth round trip). Dash renders
+    a single symbol/interval/date-range change through several callbacks
+    (chart, confluence, pattern table), each of which used to spin up and
+    never explicitly close its own connection - this pool lets them borrow
+    and return connections instead, bounding how many sockets are ever open.
+    ThreadedConnectionPool because Dash can invoke callbacks concurrently
+    across threads.
+    """
+    global _connection_pool
+    if _connection_pool is None:
+        with _connection_pool_lock:
+            if _connection_pool is None:
+                load_dotenv()
+                _connection_pool = ThreadedConnectionPool(
+                        1, 10,
+                        host="localhost",
+                        port=5432,
+                        dbname=os.getenv("POSTGRES_DB"),
+                        user="postgres",
+                        password=os.getenv("POSTGRES_PASSWORD")
+                )
+    return _connection_pool
 
 
 class RequestData():
@@ -26,7 +60,7 @@ class RequestData():
     _end_date = datetime(1970, 1, 1)
     _interval = ""
     _data_source = ""
-    _database_connection: psycopg2.extensions.connection
+    _database_connection: psycopg2.extensions.connection | None
     _api_data_class: GenericAPI
 
     def __init__(
@@ -44,13 +78,33 @@ class RequestData():
         self._data_source = data_source
         load_dotenv()
         self._update_dataclass()
-        self._database_connection = psycopg2.connect(
-                host="localhost",
-                port=5432,
-                dbname=os.getenv("POSTGRES_DB"),
-                user="postgres",
-                password=os.getenv("POSTGRES_PASSWORD")
-        )
+        # No connection is opened here. Some callers (get_authorized_intervals())
+        # only ever touch _api_data_class and never hit the database at all -
+        # borrowing lazily means that path costs zero DB connections instead of one.
+        self._database_connection = None
+
+    @property
+    def _connection(self) -> psycopg2.extensions.connection:
+        """ Borrows a connection from the shared pool on first use, memoized on this instance. """
+        if self._database_connection is None:
+            self._database_connection = _get_connection_pool().getconn()
+        return self._database_connection
+
+    def close(self) -> None:
+        """
+        Returns this instance's borrowed connection to the shared pool, if one
+        was ever borrowed. Safe to call multiple times / on instances that
+        never touched the database.
+        """
+        if self._database_connection is not None:
+            _get_connection_pool().putconn(self._database_connection)
+            self._database_connection = None
+
+    def __enter__(self) -> "RequestData":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
     def _update_dataclass(self) -> None:
         interval_to_request = self._interval
@@ -107,13 +161,19 @@ class RequestData():
         """
         Return price_candles under a list format for the specified symbol.
         This function will automatically identified if data is present in database or not.
-        If not, data will be fetch from source and put inside the database
+        If not, data will be fetch from source and put inside the database.
+        The borrowed connection is returned to the pool as soon as this call
+        finishes, so it's immediately available for the next RequestData
+        instance instead of sitting open for the lifetime of this object.
         """
-        if not self._data_exists():
-            json_data = self._request_data_from_api()
-            self._insert_price_candles(json_data)
-            self._mark_closed_days(json_data)
-        return self._query_price_candle()
+        try:
+            if not self._data_exists():
+                json_data = self._request_data_from_api()
+                self._insert_price_candles(json_data)
+                self._mark_closed_days(json_data)
+            return self._query_price_candle()
+        finally:
+            self.close()
 
     def get_price_candles_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.get_price_candles())
@@ -125,7 +185,7 @@ class RequestData():
         """
         Check if data exist with the wanted interval inside the database
         """
-        with self._database_connection.cursor() as cur:
+        with self._connection.cursor() as cur:
             interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
             cur.execute("""
                 SELECT day, MODE() WITHIN GROUP (ORDER BY diff) AS modal_diff FROM (
@@ -157,7 +217,7 @@ class RequestData():
         """
         Query price from timescaleDB, aggregating it to the request interval
         """
-        with self._database_connection.cursor() as cur:
+        with self._connection.cursor() as cur:
             interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
             cur.execute("""
                 SELECT
@@ -216,16 +276,16 @@ class RequestData():
         if not closed_days:
             return
         
-        with self._database_connection.cursor() as cur:
+        with self._connection.cursor() as cur:
             execute_values(cur, """
                 INSERT INTO closed_market_days (symbol, day)
                 VALUES %s
                 ON CONFLICT DO NOTHING
             """, [(self._action_symbol, day) for day in closed_days])
-            self._database_connection.commit()
+            self._connection.commit()
 
     def _get_closed_days(self) -> set:
-        with self._database_connection.cursor() as cur:
+        with self._connection.cursor() as cur:
             cur.execute("""
                 SELECT day FROM closed_market_days
                 WHERE symbol = %s AND day >= %s AND day < %s
@@ -245,7 +305,7 @@ class RequestData():
                     candle["volume"]
                 ) for timestamp, candle in data["data"].items()
                ]
-        with self._database_connection.cursor() as cur:
+        with self._connection.cursor() as cur:
             execute_values(cur, """
                             INSERT INTO price_candles (time, symbol, open, high, low, close, volume)
                             VALUES %s
@@ -256,4 +316,4 @@ class RequestData():
                                 close  = EXCLUDED.close,
                                 volume = EXCLUDED.volume
                            """, rows)
-        self._database_connection.commit()
+        self._connection.commit()

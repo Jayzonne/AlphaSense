@@ -87,6 +87,10 @@ def build_layout(
                 inline=True
             )
         ]),
+        # Single source of truth for OHLCV data: fetched once per symbol/interval/
+        # date-range change and fanned out to the chart, confluence, and pattern
+        # table callbacks below, instead of each of them hitting the DB on its own.
+        dcc.Store(id="price-data-store"),
         dcc.Store(id="confluence-store"),
         
         html.Div([
