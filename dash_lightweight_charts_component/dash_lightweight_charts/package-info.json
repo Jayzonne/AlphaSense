@@ -1,0 +1,5 @@
+{
+  "name": "dash_lightweight_charts",
+  "version": "0.1.0",
+  "description": "Dash component wrapping TradingView's Lightweight Charts v5, built for AlphaSense"
+}

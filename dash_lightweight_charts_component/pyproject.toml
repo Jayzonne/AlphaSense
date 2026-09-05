@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dash_lightweight_charts"
+version = "0.1.0"
+description = "Dash component wrapping TradingView's Lightweight Charts v5, built for AlphaSense"
+requires-python = ">=3.9"
+dependencies = ["dash>=2.0"]
+
+[tool.setuptools]
+packages = ["dash_lightweight_charts"]
+
+[tool.setuptools.package-data]
+dash_lightweight_charts = ["*.js", "*.json", "*.LICENSE.txt"]
