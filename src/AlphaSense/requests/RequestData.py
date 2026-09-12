@@ -13,6 +13,29 @@ import pandas as pd
 _connection_pool: ThreadedConnectionPool | None = None
 _connection_pool_lock = threading.Lock()
 
+# pd.Timedelta has no fixed-duration unit for "week"/"month" (a month is
+# 28-31 days, so pandas rejects "wk"/"mo" suffixes outright rather than
+# guessing) - yet "1wk", "1mo", and "3mo" are all listed as YahooAPI's own
+# authorized interval values. Left as-is, selecting any of them crashed
+# _data_exists()/_query_price_candle() with "invalid unit abbreviation".
+# These are fixed-duration approximations (consistent with how every other
+# interval here, including the existing "5d" case, is already treated as a
+# fixed elapsed-time bucket rather than a calendar-aware one) - "1mo"/"3mo"
+# won't line up exactly with calendar month boundaries, which is worth
+# knowing if that precision ever matters.
+_INTERVAL_MINUTES_OVERRIDE = {
+    "1wk": 7 * 24 * 60,
+    "1mo": 30 * 24 * 60,
+    "3mo": 90 * 24 * 60,
+}
+
+
+def interval_to_minutes(interval: str) -> float:
+    """ Single source of truth for turning an interval string into minutes, used for TimescaleDB bucketing. """
+    if interval in _INTERVAL_MINUTES_OVERRIDE:
+        return _INTERVAL_MINUTES_OVERRIDE[interval]
+    return pd.Timedelta(interval).total_seconds() / 60
+
 
 def _get_connection_pool() -> ThreadedConnectionPool:
     """
@@ -108,7 +131,7 @@ class RequestData():
 
     def _update_dataclass(self) -> None:
         interval_to_request = self._interval
-        interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
+        interval_in_min = interval_to_minutes(self._interval)
         # Since requested interval is 60 min for somme API, if the requested interval is more than thatn
         # Insert data with an interval of 60 min
         if interval_in_min > 60:
@@ -186,7 +209,7 @@ class RequestData():
         Check if data exist with the wanted interval inside the database
         """
         with self._connection.cursor() as cur:
-            interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
+            interval_in_min = interval_to_minutes(self._interval)
             cur.execute("""
                 SELECT day, MODE() WITHIN GROUP (ORDER BY diff) AS modal_diff FROM (
                     SELECT 
@@ -218,7 +241,7 @@ class RequestData():
         Query price from timescaleDB, aggregating it to the request interval
         """
         with self._connection.cursor() as cur:
-            interval_in_min = pd.Timedelta(self._interval).total_seconds() / 60
+            interval_in_min = interval_to_minutes(self._interval)
             cur.execute("""
                 SELECT
                     time_bucket(%s, time) AS bucket,

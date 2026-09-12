@@ -3,6 +3,8 @@ from .RequestBullishEngulfing import RequestBullishEngulfing
 from .RequestCandlePatterns import RequestCandlePatterns
 from .RequestEveningStar import RequestEveningStar
 from .RequestHammers import RequestHammers
+from .RequestHeadAndShoulders import RequestHeadAndShoulders
+from .RequestInverseHeadAndShoulders import RequestInverseHeadAndShoulders
 from .RequestMorningStar import RequestMorningStar
 from .RequestShootingStar import RequestShootingStar
 
@@ -43,12 +45,26 @@ PATTERN_REGISTRY = {
                     "class": RequestBearishEngulfing,
                     "direction": "Bearish"
                 },
+    "head_and_shoulders":
+                {
+                    "label": "Head & Shoulders",
+                    "class": RequestHeadAndShoulders,
+                    "direction": "Bearish"
+                },
+    "inverse_head_and_shoulders":
+                {
+                    "label": "Inverse Head & Shoulders",
+                    "class": RequestInverseHeadAndShoulders,
+                    "direction": "Bullish"
+                },
 }
 __all__ = ['RequestBearishEngulfing',
            'RequestBullishEngulfing',
            'RequestCandlePatterns',
            'RequestEveningStar',
            'RequestHammers',
+           'RequestHeadAndShoulders',
+           'RequestInverseHeadAndShoulders',
            'RequestMorningStar',
            'RequestShootingStar',
            'PATTERN_REGISTRY'

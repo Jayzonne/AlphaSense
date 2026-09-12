@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta
 from dash import Dash
 
-from AlphaSense.frontend.plotly.data_access import get_authorized_intervals
-from AlphaSense.frontend.plotly.layout import build_layout
-import AlphaSense.frontend.plotly.callbacks  # noqa: F401 - imported for its @callback registration side-effect
+from AlphaSense.frontend.data_access import get_authorized_intervals
+from AlphaSense.frontend.lightweight_charts.layout import build_layout
+from AlphaSense.requests.quotes import get_curated_quotes
+import AlphaSense.frontend.lightweight_charts.callbacks  # noqa: F401 - imported for its @callback registration side-effect
 
 DEFAULT_SYMBOL = "AAPL"
 DEFAULT_INTERVAL = "5m"
@@ -17,6 +18,7 @@ app.layout = build_layout(
     default_start_date=DEFAULT_START_DATE,
     default_end_date=DEFAULT_END_DATE,
     authorized_intervals=get_authorized_intervals(),
+    curated_quotes=get_curated_quotes(),  # best-effort; renders an empty (but usable) quick-pick if this comes back empty
 )
 
 if __name__ == "__main__":

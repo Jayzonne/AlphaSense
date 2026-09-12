@@ -1,22 +1,115 @@
 import pandas as pd
-from dash import callback, Input, Output, State
+from datetime import datetime, timedelta
+from dash import callback, Input, Output, State, ALL, ctx, no_update
 
 from AlphaSense.requests.candle_patterns import PATTERN_REGISTRY
-from AlphaSense.frontend.plotly.data_access import (
+from AlphaSense.requests.quotes import get_single_quote
+from AlphaSense.frontend.data_access import (
     get_price_candles_dataframe, to_minutes, dataframe_to_records, dataframe_from_records,
 )
-from AlphaSense.frontend.plotly.chart_utils import _resolve_indicator
+from AlphaSense.frontend.indicator_resolution import resolve_indicator
 from AlphaSense.analysis.confluence import compute_confluence
 from AlphaSense.frontend.lightweight_charts.serializers import (
-    candles_to_lwc, overlays_to_lwc, subplots_to_lwc, markers_to_lwc,
+    candles_to_lwc, overlays_to_lwc, subplots_to_lwc, markers_to_lwc, confluence_markers_to_lwc,
 )
 
 # update_price_data / update_confluence / update_pattern_table below are the
-# same glue over the same shared data layer (get_price_candles_dataframe,
-# compute_confluence, PATTERN_REGISTRY) as AlphaSense.frontend.plotly.callbacks
-# - duplicated here rather than shared because they're wired to a separate
-# Dash app instance. If the Plotly frontend is retired, these three plus
-# _resolve_indicator are the natural candidates to hoist into one shared module.
+# glue over the shared data layer (get_price_candles_dataframe,
+# compute_confluence, PATTERN_REGISTRY) that this is the only remaining
+# frontend for - the Plotly version was retired once this one covered
+# everything it did and more.
+
+# (span, interval) per preset. Longer spans step down to coarser intervals so
+# the chart doesn't try to render e.g. a year of 5-minute candles. "1wk" and
+# "1mo" only became safe to use here after fixing interval_to_minutes() (see
+# RequestData.py) - they used to crash _data_exists()/_query_price_candle().
+_RANGE_PRESETS = {
+    "1D": (timedelta(days=1), "5m"),
+    "1W": (timedelta(days=7), "30m"),
+    "1M": (timedelta(days=30), "1h"),
+    "YTD": (None, "1d"),  # start of the current calendar year - handled specially below
+    "1Y": (timedelta(days=365), "1d"),
+    "5Y": (timedelta(days=5 * 365), "1wk"),
+    "MAX": (timedelta(days=20 * 365), "1mo"),  # RequestData has no "earliest available" concept, so this is a generous proxy for it rather than a true max
+}
+
+
+def _resolve_preset(preset_key: str) -> tuple[datetime, datetime, str] | None:
+    """ Pure date-math core of apply_range_preset(), kept separate so it's directly testable without a real Dash callback context. """
+    if preset_key not in _RANGE_PRESETS:
+        return None
+    span, interval = _RANGE_PRESETS[preset_key]
+    end = datetime.now()
+    start = datetime(end.year, 1, 1) if span is None else end - span
+    return start, end, interval
+
+
+@callback(
+    Output("date-range", "start_date"),
+    Output("date-range", "end_date"),
+    Output("interval-select", "value"),
+    Input({"type": "range-preset", "index": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def apply_range_preset(_):
+    """ One callback for every preset button (1D/1W/.../MAX), identified via Dash's pattern-matching IDs. """
+    triggered = ctx.triggered_id
+    resolved = _resolve_preset(triggered["index"]) if triggered else None
+    if resolved is None:
+        return no_update, no_update, no_update
+    return resolved
+
+
+@callback(
+    Output("symbol-input", "value"),
+    Input("quick-pick-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def apply_quick_pick(selected_symbol):
+    """ Copies a curated quick-pick selection into the free-text symbol field, which already drives everything else. """
+    if not selected_symbol:
+        return no_update
+    return selected_symbol
+
+
+@callback(
+    Output("quick-pick-dropdown", "options"),
+    Input("quick-pick-store", "data"),
+)
+def sync_quick_pick_options(quotes):
+    """ Keeps the dropdown's options in sync with quick-pick-store, so add_to_quick_list() below can grow the list live. """
+    quotes = quotes or []
+    return [
+        {"label": f"{q['name']} ({q['symbol']}) \u2014 {q['price']} {q['currency']}".strip(), "value": q["symbol"]}
+        for q in quotes
+    ]
+
+
+@callback(
+    Output("quick-pick-store", "data"),
+    Output("quicklist-feedback", "children"),
+    Input("add-to-quicklist-btn", "n_clicks"),
+    State("symbol-input", "value"),
+    State("quick-pick-store", "data"),
+    prevent_initial_call=True,
+)
+def add_to_quick_list(n_clicks, symbol, current_list):
+    """
+    Adds whatever's currently in the symbol field to the quick-pick list,
+    fetching its live price the same way the curated starting list does.
+    Session-only, same caveat as quick-pick-store itself.
+    """
+    if not symbol or not symbol.strip():
+        return no_update, "Enter a symbol first."
+    symbol = symbol.strip().upper()
+    current_list = current_list or []
+    if any(q["symbol"] == symbol for q in current_list):
+        return no_update, f"{symbol} is already in the quick list."
+    quote = get_single_quote(symbol)
+    if quote is None:
+        return no_update, f"Couldn't fetch a quote for '{symbol}' - check the symbol and try again."
+    return current_list + [quote], f"Added {quote['name']} ({symbol}) to the quick list."
+
 
 
 @callback(
@@ -94,6 +187,7 @@ def update_pattern_table(store_data, selected_patterns, symbol, interval, start_
             rows.append({
                 "time": pd.Timestamp(candle["time"]).isoformat(),
                 "pattern": entry["label"],
+                "pattern_key": key,
                 "direction": entry["direction"],
                 "interval_minutes": interval_minutes,
             })
@@ -105,32 +199,37 @@ def update_pattern_table(store_data, selected_patterns, symbol, interval, start_
     Output("candle-chart", "candles"),
     Output("candle-chart", "overlays"),
     Output("candle-chart", "subplots"),
+    Output("candle-chart", "markers"),
     Output("symbol-error", "children"),
     Input("price-data-store", "data"),
     Input("indicator-checklist", "value"),
     Input("confluence-threshold", "value"),
     Input("confluence-store", "data"),
+    Input("pattern-table", "data"),
     State("symbol-input", "value"),
     State("interval-select", "value"),
 )
-def update_chart(store_data, selected_indicators, threshold, confluence_data, symbol, interval):
+def update_chart(store_data, selected_indicators, threshold, confluence_data, pattern_rows, symbol, interval):
     """
-    Fills in the LightweightChart component's candles/overlays/subplots
-    props. Reuses confluence-store's already-computed indicator values via
-    the same _resolve_indicator() reuse-or-recompute rule the Plotly frontend
-    uses (see chart_utils.py), so toggling the indicator checklist doesn't
-    trigger a fresh _compute() call for anything confluence already computed.
+    Fills in the LightweightChart component's candles/overlays/subplots/
+    markers props. Reuses confluence-store's already-computed indicator
+    values via resolve_indicator()'s reuse-or-recompute rule, so toggling the
+    indicator checklist doesn't trigger a fresh _compute() call for anything
+    confluence already computed. Also folds in pattern-table's rows so each
+    candle's hover tooltip can show which pattern(s), not just which
+    indicators, fired there, and so pattern/confluence markers don't collide
+    (see confluence_markers_to_lwc).
     """
     if not symbol:
-        return [], [], [], ""
+        return [], [], [], [], ""
 
     store_data = store_data or {}
     if store_data.get("error"):
-        return [], [], [], f"Error fetching data for '{symbol.upper()}': {store_data['error']}"
+        return [], [], [], [], f"Error fetching data for '{symbol.upper()}': {store_data['error']}"
 
     df = dataframe_from_records(store_data.get("records"))
     if df.empty:
-        return [], [], [], f"No data found for symbol '{symbol.upper()}'"
+        return [], [], [], [], f"No data found for symbol '{symbol.upper()}'"
 
     confluence_data = confluence_data or {}
     confluence = confluence_data.get("confluence", {})
@@ -140,21 +239,15 @@ def update_chart(store_data, selected_indicators, threshold, confluence_data, sy
     }
 
     def resolve(key, entry):
-        return _resolve_indicator(key, entry, df, symbol.upper(), interval, precomputed)
+        return resolve_indicator(key, entry, df, symbol.upper(), interval, precomputed)
 
+    pattern_rows = pattern_rows or []
     selected_indicators = selected_indicators or []
-    candles = candles_to_lwc(df, confluence, threshold)
+    candles = candles_to_lwc(df, confluence, threshold, pattern_rows)
     overlays = overlays_to_lwc(selected_indicators, resolve)
     subplots = subplots_to_lwc(selected_indicators, resolve)
-    return candles, overlays, subplots, ""
-
-
-@callback(
-    Output("candle-chart", "markers"),
-    Input("pattern-table", "data"),
-)
-def update_markers(pattern_rows):
-    return markers_to_lwc(pattern_rows or [])
+    markers = markers_to_lwc(pattern_rows) + confluence_markers_to_lwc(confluence, threshold, pattern_rows)
+    return candles, overlays, subplots, markers, ""
 
 
 @callback(

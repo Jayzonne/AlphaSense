@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from AlphaSense.requests.RequestData import RequestData
+from AlphaSense.requests.RequestData import RequestData, interval_to_minutes
 
 
 def get_price_candles_dataframe(
@@ -61,9 +61,11 @@ def dataframe_from_records(records: list[dict] | None) -> pd.DataFrame:
 
 def to_minutes(interval: str) -> float:
     """
-    Converts a Yahoo-style interval string ('1m', '5m', '1h', '1d', ...) into minutes.
-    Long-form intervals ('1wk', '1mo', '3mo') aren't a fixed duration - pandas
-    raises on those, which the calling callback's try/except turns into an
-    error banner rather than a hard crash.
+    Converts a Yahoo-style interval string ('1m', '5m', '1h', '1d', ...) into
+    minutes. Delegates to RequestData.interval_to_minutes(), which also
+    handles '1wk'/'1mo'/'3mo' - those used to raise inside pd.Timedelta
+    (invalid unit abbreviation), silently turned into an error banner by the
+    calling callback's try/except rather than a hard crash. Now fixed at the
+    source instead of just contained here.
     """
-    return pd.Timedelta(interval).total_seconds() / 60
+    return interval_to_minutes(interval)
