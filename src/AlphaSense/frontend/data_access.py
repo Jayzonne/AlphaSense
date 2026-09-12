@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from AlphaSense.requests.RequestData import RequestData, interval_to_minutes
 
 
@@ -69,3 +69,31 @@ def to_minutes(interval: str) -> float:
     source instead of just contained here.
     """
     return interval_to_minutes(interval)
+
+
+# (span, interval) per named time-range preset. Longer spans step down to
+# coarser intervals so a chart (or a backtest) doesn't try to work with e.g.
+# a year of 5-minute candles. "1wk" and "1mo" only became safe to use here
+# after fixing interval_to_minutes() above - they used to crash
+# _data_exists()/_query_price_candle(). Shared between the Dash UI's preset
+# buttons and the backtest CLI's --preset flag, so "YTD" means exactly the
+# same date range and interval in both places.
+RANGE_PRESETS = {
+    "1D": (timedelta(days=1), "5m"),
+    "1W": (timedelta(days=7), "30m"),
+    "1M": (timedelta(days=30), "1h"),
+    "YTD": (None, "1d"),  # start of the current calendar year - handled specially below
+    "1Y": (timedelta(days=365), "1d"),
+    "5Y": (timedelta(days=5 * 365), "1wk"),
+    "MAX": (timedelta(days=20 * 365), "1mo"),  # RequestData has no "earliest available" concept, so this is a generous proxy for it rather than a true max
+}
+
+
+def resolve_range_preset(preset_key: str, now: datetime = None) -> tuple[datetime, datetime, str] | None:
+    """ Resolves a RANGE_PRESETS key into (start, end, interval), or None if the key isn't recognized. """
+    if preset_key not in RANGE_PRESETS:
+        return None
+    span, interval = RANGE_PRESETS[preset_key]
+    end = now or datetime.now()
+    start = datetime(end.year, 1, 1) if span is None else end - span
+    return start, end, interval

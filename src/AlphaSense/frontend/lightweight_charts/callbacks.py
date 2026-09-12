@@ -1,11 +1,11 @@
 import pandas as pd
-from datetime import datetime, timedelta
 from dash import callback, Input, Output, State, ALL, ctx, no_update
 
 from AlphaSense.requests.candle_patterns import PATTERN_REGISTRY
 from AlphaSense.requests.quotes import get_single_quote
 from AlphaSense.frontend.data_access import (
     get_price_candles_dataframe, to_minutes, dataframe_to_records, dataframe_from_records,
+    resolve_range_preset,
 )
 from AlphaSense.frontend.indicator_resolution import resolve_indicator
 from AlphaSense.analysis.confluence import compute_confluence
@@ -19,30 +19,6 @@ from AlphaSense.frontend.lightweight_charts.serializers import (
 # frontend for - the Plotly version was retired once this one covered
 # everything it did and more.
 
-# (span, interval) per preset. Longer spans step down to coarser intervals so
-# the chart doesn't try to render e.g. a year of 5-minute candles. "1wk" and
-# "1mo" only became safe to use here after fixing interval_to_minutes() (see
-# RequestData.py) - they used to crash _data_exists()/_query_price_candle().
-_RANGE_PRESETS = {
-    "1D": (timedelta(days=1), "5m"),
-    "1W": (timedelta(days=7), "30m"),
-    "1M": (timedelta(days=30), "1h"),
-    "YTD": (None, "1d"),  # start of the current calendar year - handled specially below
-    "1Y": (timedelta(days=365), "1d"),
-    "5Y": (timedelta(days=5 * 365), "1wk"),
-    "MAX": (timedelta(days=20 * 365), "1mo"),  # RequestData has no "earliest available" concept, so this is a generous proxy for it rather than a true max
-}
-
-
-def _resolve_preset(preset_key: str) -> tuple[datetime, datetime, str] | None:
-    """ Pure date-math core of apply_range_preset(), kept separate so it's directly testable without a real Dash callback context. """
-    if preset_key not in _RANGE_PRESETS:
-        return None
-    span, interval = _RANGE_PRESETS[preset_key]
-    end = datetime.now()
-    start = datetime(end.year, 1, 1) if span is None else end - span
-    return start, end, interval
-
 
 @callback(
     Output("date-range", "start_date"),
@@ -52,9 +28,14 @@ def _resolve_preset(preset_key: str) -> tuple[datetime, datetime, str] | None:
     prevent_initial_call=True,
 )
 def apply_range_preset(_):
-    """ One callback for every preset button (1D/1W/.../MAX), identified via Dash's pattern-matching IDs. """
+    """
+    One callback for every preset button (1D/1W/.../MAX), identified via
+    Dash's pattern-matching IDs. Date math itself lives in
+    AlphaSense.frontend.data_access.resolve_range_preset(), shared with the
+    backtest CLI's --preset flag so "YTD" means the same thing in both places.
+    """
     triggered = ctx.triggered_id
-    resolved = _resolve_preset(triggered["index"]) if triggered else None
+    resolved = resolve_range_preset(triggered["index"]) if triggered else None
     if resolved is None:
         return no_update, no_update, no_update
     return resolved

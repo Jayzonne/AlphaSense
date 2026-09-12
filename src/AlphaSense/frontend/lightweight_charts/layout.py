@@ -5,11 +5,12 @@ from dash_lightweight_charts import LightweightChart
 
 from AlphaSense.requests.candle_patterns import PATTERN_REGISTRY
 from AlphaSense.requests.indicators import INDICATOR_REGISTRY
+from AlphaSense.frontend.data_access import RANGE_PRESETS
 from AlphaSense.frontend.lightweight_charts.serializers import (
     BULLISH_CONFLUENCE_COLOR, BEARISH_CONFLUENCE_COLOR, pattern_legend,
 )
 
-_RANGE_PRESET_LABELS = ["1D", "1W", "1M", "YTD", "1Y", "5Y", "MAX"]
+_RANGE_PRESET_LABELS = list(RANGE_PRESETS.keys())
 
 
 def _legend() -> html.Div:

@@ -44,6 +44,25 @@ class YahooAPI(GenericAPI):
         self._end_date = end_date
         self._interval = interval
         self._action_symbol = action_symbol
+
+    @staticmethod
+    def _format_yahoo_date(date: datetime, offset_days: int = 0) -> str:
+        """
+        Formats a date as YYYY-MM-DD for yfinance, optionally shifted by
+        offset_days first (used for the end date: yfinance's `end` is
+        EXCLUSIVE, so it needs +1 day to actually include it).
+
+        Shifting via timedelta() BEFORE formatting is the part that matters:
+        the previous inline version built the string from the original
+        date's year/month but a separately-offset day, e.g.
+        f"{end.year}-{end.month}-{(end + timedelta(days=1)).day}" - which is
+        wrong (and can even be an invalid date) whenever end_date falls on
+        the last day of a month, since only the day component ever actually
+        advanced. Example: end_date = 2026-01-31 produced "2026-01-01"
+        instead of "2026-02-01".
+        """
+        shifted = date + timedelta(days=offset_days)
+        return f"{shifted.year}-{str(shifted.month).zfill(2)}-{str(shifted.day).zfill(2)}"
     
     def _get_daily_closes(self) -> Dict[str, float]:
         """
@@ -54,12 +73,8 @@ class YahooAPI(GenericAPI):
         """
         daily_data = yf.download(self._action_symbol,
                                  interval="1d",
-                                 start=f"{str(self._start_date.year)}-\
-{str(self._start_date.month).zfill(2)}-\
-{str(self._start_date.day).zfill(2)}",
-                                 end=f"{str(self._end_date.year)}-\
-{str(self._end_date.month).zfill(2)}-\
-{str(self._end_date.day).zfill(2)}",
+                                 start=self._format_yahoo_date(self._start_date),
+                                 end=self._format_yahoo_date(self._end_date),
                                  auto_adjust=False
                                  )
         if daily_data is None or daily_data.empty:
@@ -114,12 +129,8 @@ class YahooAPI(GenericAPI):
     def get_json_api(self) -> Dict:
         data = yf.download(self._action_symbol,
                            interval=self.interval,
-                           start=f"{str(self._start_date.year)}-\
-{str(self._start_date.month).zfill(2)}-\
-{str(self._start_date.day).zfill(2)}",
-                           end=f"{str(self._end_date.year)}-\
-{str(self._end_date.month).zfill(2)}-\
-{str((self._end_date + timedelta(days=1)).day).zfill(2)}"
+                           start=self._format_yahoo_date(self._start_date),
+                           end=self._format_yahoo_date(self._end_date, offset_days=1)
                            )
         if data is None:
             raise ValueError("Error when requesting yahoo API, \
