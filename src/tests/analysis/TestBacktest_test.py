@@ -1167,5 +1167,803 @@ class TestTrendProvider(unittest.TestCase):
         self.assertTrue(by_direction["short"].trades)
 
 
+class TestThresholdHysteresis(unittest.TestCase):
+    """Separate entry and exit thresholds (W1-S07).
+
+    The legacy single-threshold behaviour must be reproduced bit-for-bit when
+    both new parameters are omitted or set to `threshold`.
+    """
+
+    def test_default_thresholds_are_identical_to_legacy(self):
+        df = _candles([99, 100, 99, 120, 121, 118, 125, 130])
+        confluence = {}
+        for index, kind, count in [
+            (0, "bullish", 3), (2, "bearish", 2), (3, "bullish", 1),
+            (4, "bearish", 3), (5, "bullish", 3), (6, "bearish", 2),
+        ]:
+            confluence.update(_confluence_at(df, index, **{kind: count}))
+
+        cases = [
+            ("long", 1, 0.0),
+            ("short", 2, 0.01),
+            ("reverse", 2, 0.0),
+            ("reverse", 3, 0.015),
+            ("long", 3, 0.01),
+            ("short", 1, 0.005),
+        ]
+        for direction, threshold, fee_rate in cases:
+            with self.subTest(direction=direction, threshold=threshold, fee_rate=fee_rate):
+                legacy = simulate_wallet(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction,
+                )
+                implicit = simulate_wallet(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction,
+                    entry_threshold=None, exit_threshold=None,
+                )
+                explicit = simulate_wallet(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction,
+                    entry_threshold=threshold, exit_threshold=threshold,
+                )
+
+                self.assertEqual(legacy, implicit)
+                self.assertEqual(legacy, explicit)
+                self.assertEqual(len(implicit), 2)
+
+    def test_hysteresis_reduces_trades_with_an_oscillating_signal(self):
+        # Reverse mode: after the weak bearish signal (count 1) exits the long
+        # without flipping, the later strong bearish signal opens a fresh
+        # short, so the wide (2, 2) threshold keeps the long through the noise
+        # and then flips back and forth, generating more trades.
+        df = _candles([100 + i for i in range(7)])
+        counts = [
+            (0, 0),  # bar 0: nothing
+            (2, 0),  # bar 1: bullish entry
+            (0, 1),  # bar 2: weak bearish -> exit only (below entry_threshold)
+            (2, 2),  # bar 3: both sides clear the entry threshold
+            (2, 0),  # bar 4
+            (0, 0),
+        ]
+        confluence = {}
+        for index, (bullish, bearish) in enumerate(counts):
+            confluence.update(_confluence_at(df, index, bullish=bullish, bearish=bearish))
+
+        _, hysteresis = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="reverse", entry_threshold=2, exit_threshold=1,
+        )
+        _, wide = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="reverse", entry_threshold=2, exit_threshold=2,
+        )
+
+        self.assertLess(len(hysteresis), len(wide))
+        self.assertEqual(len(hysteresis), 4)
+        self.assertEqual(len(wide), 6)
+
+    def test_exit_uses_exit_threshold_not_entry_threshold(self):
+        # A bearish count of 1 is below entry_threshold=2 but reaches
+        # exit_threshold=1: it must still close an open long.
+        df = _candles([99, 100, 101, 102, 103])
+        confluence = _confluence_at(df, 0, bullish=2)
+        confluence.update(_confluence_at(df, 1, bearish=1))
+
+        _, hysteresis = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="long", entry_threshold=2, exit_threshold=1,
+        )
+        _, wide = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="long", entry_threshold=2, exit_threshold=2,
+        )
+
+        self.assertEqual([t.action for t in hysteresis], ["BUY", "SELL"])
+        # With exit_threshold=2 the weak signal is ignored and the long is
+        # only closed by the end-of-run liquidation.
+        self.assertEqual(
+            [t.action for t in wide], ["BUY", "SELL (liquidated at end)"]
+        )
+
+    def test_short_exit_uses_exit_threshold_not_entry_threshold(self):
+        # Mirror image for a short: a bullish count of 1 covers the short.
+        df = _candles([99, 100, 101, 102, 103])
+        confluence = _confluence_at(df, 0, bearish=2)
+        confluence.update(_confluence_at(df, 1, bullish=1))
+
+        _, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="short", entry_threshold=2, exit_threshold=1,
+        )
+
+        self.assertEqual([t.action for t in trades], ["SELL (short)", "BUY (cover)"])
+
+    def test_direction_isolation_opposite_signals_never_open_the_other_side(self):
+        # In long-only mode, bearish signals may only close a long; while flat
+        # they are inert and must not open a short. The next long entry is
+        # still driven solely by its own (bullish) entry count.
+        df = _candles([100, 101, 102, 103, 104, 105, 106, 107])
+
+        long_conf = _confluence_at(df, 0, bullish=2)
+        long_conf.update(_confluence_at(df, 1, bearish=3))
+        long_conf.update(_confluence_at(df, 2, bearish=3))
+        long_conf.update(_confluence_at(df, 3, bullish=2))
+        _, long_trades = simulate_wallet(
+            df, long_conf, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="long", entry_threshold=2, exit_threshold=1,
+        )
+        self.assertEqual(
+            [t.action for t in long_trades],
+            ["BUY", "SELL", "BUY", "SELL (liquidated at end)"],
+        )
+
+        short_conf = _confluence_at(df, 0, bearish=2)
+        short_conf.update(_confluence_at(df, 1, bullish=3))
+        short_conf.update(_confluence_at(df, 2, bullish=3))
+        short_conf.update(_confluence_at(df, 3, bearish=2))
+        _, short_trades = simulate_wallet(
+            df, short_conf, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="short", entry_threshold=2, exit_threshold=1,
+        )
+        self.assertEqual(
+            [t.action for t in short_trades],
+            ["SELL (short)", "BUY (cover)", "SELL (short)", "BUY (cover liquidated at end)"],
+        )
+
+    def test_reverse_weak_opposite_signal_closes_without_flipping(self):
+        # (entry=2, exit=1) in reverse mode: a count-1 opposite signal closes
+        # the current leg but is too weak to open the opposite one, while a
+        # count-2 opposite signal is strong enough to open it.
+        df = _candles([100 + i for i in range(7)])
+        confluence = _confluence_at(df, 0, bullish=2)
+        confluence.update(_confluence_at(df, 1, bearish=1))
+        confluence.update(_confluence_at(df, 2, bearish=2))
+        confluence.update(_confluence_at(df, 3, bullish=1))
+        confluence.update(_confluence_at(df, 4, bullish=2))
+
+        _, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="reverse", entry_threshold=2, exit_threshold=1,
+        )
+
+        self.assertEqual(
+            [t.action for t in trades],
+            ["BUY", "SELL", "SELL (short)", "BUY (cover)", "BUY", "SELL (liquidated at end)"],
+        )
+
+    def test_reverse_strong_opposite_signal_flips_using_entry_threshold(self):
+        # A count-2 opposite signal exits the long and immediately opens the
+        # new leg at the same price (the new leg uses entry_threshold).
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = _confluence_at(df, 0, bullish=2)
+        confluence.update(_confluence_at(df, 1, bearish=2))
+
+        _, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="reverse", entry_threshold=2, exit_threshold=1,
+        )
+
+        self.assertEqual(
+            [t.action for t in trades],
+            ["BUY", "SELL", "SELL (short)", "BUY (cover liquidated at end)"],
+        )
+        self.assertEqual(trades[1].price, trades[2].price)
+        self.assertEqual(trades[1].time, trades[2].time)
+
+    def test_simulate_wallet_keeps_two_tuple_with_hysteresis(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = _confluence_at(df, 0, bullish=2)
+        confluence.update(_confluence_at(df, 1, bearish=1))
+
+        result = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01, starting_cash=1000.0,
+            direction="reverse", entry_threshold=2, exit_threshold=1,
+        )
+        full = simulate_wallet_with_equity(
+            df, confluence, threshold=2, fee_rate=0.01, starting_cash=1000.0,
+            direction="reverse", entry_threshold=2, exit_threshold=1,
+        )
+
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], full[0])
+        self.assertEqual(result[1], full[1])
+
+    def test_invalid_explicit_thresholds_are_rejected(self):
+        df = _candles([100, 101, 102])
+        with self.assertRaises(ValueError):
+            simulate_wallet(df, {}, threshold=1, fee_rate=0.0, entry_threshold=0)
+        with self.assertRaises(ValueError):
+            simulate_wallet(df, {}, threshold=1, fee_rate=0.0, exit_threshold=-1)
+
+    def test_backtest_symbol_and_run_backtest_forward_hysteresis(self):
+        from unittest.mock import patch
+
+        df = _candles([100 + i for i in range(7)])
+        counts = [(0, 0), (2, 0), (0, 1), (2, 2), (2, 0), (0, 0)]
+        fixed = {}
+        for index, (bullish, bearish) in enumerate(counts):
+            fixed.update(_confluence_at(df, index, bullish=bullish, bearish=bearish))
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_hysteresis_fixed", lambda **kwargs: FixedSignalProvider())
+
+        expected_cash, expected_trades = simulate_wallet(
+            df, fixed, threshold=2, fee_rate=0.0, starting_cash=1000.0,
+            direction="reverse", entry_threshold=2, exit_threshold=1,
+        )
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[2], fee_rates=[0.0], direction="reverse",
+                signal_provider="test_hysteresis_fixed",
+                entry_threshold=2, exit_threshold=1,
+            )
+            frame = run_backtest(
+                symbols=["TEST"], start=df.index.min(), end=df.index.max(), interval="1h",
+                thresholds=[2], fee_rates=[0.0], direction="reverse",
+                signal_provider="test_hysteresis_fixed",
+                entry_threshold=2, exit_threshold=1,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0].final_value, expected_cash)
+        self.assertEqual(
+            [t.action for t in results[0].trades],
+            [t.action for t in expected_trades],
+        )
+        self.assertEqual(len(frame), 1)
+        self.assertTrue(pd.isna(frame.iloc[0]["error"]))
+        self.assertAlmostEqual(frame.iloc[0]["final_value"], round(expected_cash, 2))
+
+
+class TestFixedTransactionFee(unittest.TestCase):
+    """Absolute per-fill transaction fee (W1-S06b).
+
+    fee_fixed is charged once per paid fill (entry, exit/cover, both legs of a
+    flip and the end-of-run liquidation), in addition to the existing
+    percentage fee_rate. fee_fixed=0.0 must be bit-for-bit identical to the
+    legacy behaviour.
+    """
+
+    @staticmethod
+    def _mixed_signals(df: pd.DataFrame) -> dict:
+        confluence = {}
+        for index, kind, count in [
+            (0, "bullish", 3), (2, "bearish", 2), (3, "bullish", 1),
+            (4, "bearish", 3), (5, "bullish", 3), (6, "bearish", 2),
+        ]:
+            confluence.update(_confluence_at(df, index, **{kind: count}))
+        return confluence
+
+    def test_zero_fee_fixed_is_identical_to_legacy_for_every_direction(self):
+        df = _candles([99, 100, 99, 120, 121, 118, 125, 130])
+        confluence = self._mixed_signals(df)
+        cases = [
+            ("long", 1, 0.0),
+            ("short", 2, 0.01),
+            ("reverse", 2, 0.0),
+            ("reverse", 3, 0.015),
+            ("long", 3, 0.01),
+            ("short", 1, 0.005),
+        ]
+        for direction, threshold, fee_rate in cases:
+            with self.subTest(direction=direction, threshold=threshold, fee_rate=fee_rate):
+                legacy = simulate_wallet(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction,
+                )
+                explicit = simulate_wallet(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction, fee_fixed=0.0,
+                )
+                full = simulate_wallet_with_equity(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction, fee_fixed=0.0,
+                )
+
+                self.assertEqual(legacy, explicit)
+                self.assertEqual(len(explicit), 2)
+                self.assertEqual(legacy[0], full[0])
+                self.assertEqual(legacy[1], full[1])
+                self.assertEqual(len(full), 3)
+                self.assertEqual(
+                    [(t.action, t.time, t.price, t.fee_paid) for t in legacy[1]],
+                    [(t.action, t.time, t.price, t.fee_paid) for t in explicit[1]],
+                )
+
+    def test_long_round_trip_charges_one_fee_per_fill(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 2, bearish=3))
+
+        baseline, baseline_trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="long",
+        )
+        charged, charged_trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="long", fee_fixed=1.5,
+        )
+
+        self.assertEqual([t.action for t in charged_trades], ["BUY", "SELL"])
+        self.assertEqual(len(charged_trades), 2)
+        self.assertAlmostEqual(baseline - charged, len(charged_trades) * 1.5, places=10)
+
+    def test_short_round_trip_charges_one_fee_per_fill(self):
+        df = _candles([99, 100, 99, 80, 81])
+        confluence = _confluence_at(df, 0, bearish=3)
+        confluence.update(_confluence_at(df, 2, bullish=3))
+
+        baseline, baseline_trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="short",
+        )
+        charged, charged_trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="short", fee_fixed=1.5,
+        )
+
+        self.assertEqual([t.action for t in charged_trades], ["SELL (short)", "BUY (cover)"])
+        self.assertEqual(len(charged_trades), 2)
+        self.assertAlmostEqual(baseline - charged, len(charged_trades) * 1.5, places=10)
+
+    def test_reverse_long_to_short_flip_counts_both_legs(self):
+        # 4 paid fills: long entry, flip sale, flip short entry, end-of-run
+        # cover. The flip itself is the middle two fills.
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 2, bearish=3))
+
+        baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse",
+        )
+        charged, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse", fee_fixed=1.0,
+        )
+
+        self.assertEqual(
+            [t.action for t in trades],
+            ["BUY", "SELL", "SELL (short)", "BUY (cover liquidated at end)"],
+        )
+        self.assertEqual(len(trades), 4)
+        self.assertAlmostEqual(baseline - charged, len(trades) * 1.0, places=10)
+
+    def test_reverse_short_to_long_flip_counts_both_legs(self):
+        df = _candles([99, 100, 99, 80, 81])
+        confluence = _confluence_at(df, 0, bearish=3)
+        confluence.update(_confluence_at(df, 2, bullish=3))
+
+        baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse",
+        )
+        charged, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse", fee_fixed=1.0,
+        )
+
+        self.assertEqual(
+            [t.action for t in trades],
+            ["SELL (short)", "BUY (cover)", "BUY", "SELL (liquidated at end)"],
+        )
+        self.assertEqual(len(trades), 4)
+        self.assertAlmostEqual(baseline - charged, len(trades) * 1.0, places=10)
+
+    def test_combines_with_percentage_fee_without_replacing_it(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 2, bearish=3))
+
+        baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="long",
+        )
+        charged, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="long", fee_fixed=2.0,
+        )
+
+        # The percentage fee still applies on both legs (1176.12 with no
+        # fixed fee), and the fixed fee is deducted twice on top.
+        self.assertAlmostEqual(baseline, 1176.12, places=2)
+        self.assertAlmostEqual(charged, 1176.12 - 2 * 2.0, places=2)
+        self.assertEqual(len(trades), 2)
+
+    def test_end_of_run_liquidation_is_charged(self):
+        df = _candles([99, 100, 105, 110, 130])
+        confluence = _confluence_at(df, 0, bullish=3)
+
+        long_baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="long",
+        )
+        long_charged, long_trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="long", fee_fixed=1.0,
+        )
+        self.assertEqual(
+            [t.action for t in long_trades], ["BUY", "SELL (liquidated at end)"]
+        )
+        self.assertAlmostEqual(long_baseline - long_charged, 2 * 1.0, places=10)
+
+        short_conf = _confluence_at(df, 0, bearish=3)
+        short_baseline, _ = simulate_wallet(
+            df, short_conf, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="short",
+        )
+        short_charged, short_trades = simulate_wallet(
+            df, short_conf, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="short", fee_fixed=1.0,
+        )
+        self.assertEqual(
+            [t.action for t in short_trades],
+            ["SELL (short)", "BUY (cover liquidated at end)"],
+        )
+        self.assertAlmostEqual(short_baseline - short_charged, 2 * 1.0, places=10)
+
+    def test_simulate_wallet_keeps_two_tuple_and_matches_equity_variant(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 2, bearish=3))
+
+        result = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="reverse", fee_fixed=1.25,
+        )
+        full = simulate_wallet_with_equity(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="reverse", fee_fixed=1.25,
+        )
+
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], full[0])
+        self.assertEqual(result[1], full[1])
+
+    def test_backtest_symbol_and_run_backtest_forward_fee_fixed(self):
+        from unittest.mock import patch
+
+        df = _candles([99, 100, 99, 120, 121, 118, 125, 130])
+        fixed = self._mixed_signals(df)
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_fee_fixed_fixed", lambda **kwargs: FixedSignalProvider())
+
+        expected_cash, expected_trades = simulate_wallet(
+            df, fixed, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse", fee_fixed=1.5,
+        )
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[2], fee_rates=[0.0], direction="reverse",
+                signal_provider="test_fee_fixed_fixed", fee_fixed=1.5,
+            )
+            frame = run_backtest(
+                symbols=["TEST"], start=df.index.min(), end=df.index.max(), interval="1h",
+                thresholds=[2], fee_rates=[0.0], direction="reverse",
+                signal_provider="test_fee_fixed_fixed", fee_fixed=1.5,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0].final_value, expected_cash)
+        self.assertEqual(
+            [t.action for t in results[0].trades],
+            [t.action for t in expected_trades],
+        )
+        self.assertEqual(len(frame), 1)
+        self.assertTrue(pd.isna(frame.iloc[0]["error"]))
+        self.assertAlmostEqual(frame.iloc[0]["final_value"], round(expected_cash, 2))
+
+
+class TestSlippageCostModel(unittest.TestCase):
+    """Adverse execution slippage (W1-S06).
+
+    slippage_bps only adjusts the execution price of every paid fill, always
+    against the trader: buys fill above the raw price, sells below it. It is
+    independent of fee_rate (percentage of notional) and fee_fixed (absolute
+    per fill). slippage_bps=0.0 must be bit-for-bit identical to the legacy
+    no-slippage behaviour.
+    """
+
+    @staticmethod
+    def _mixed_signals(df: pd.DataFrame) -> dict:
+        confluence = {}
+        for index, kind, count in [
+            (0, "bullish", 3), (2, "bearish", 2), (3, "bullish", 1),
+            (4, "bearish", 3), (5, "bullish", 3), (6, "bearish", 2),
+        ]:
+            confluence.update(_confluence_at(df, index, **{kind: count}))
+        return confluence
+
+    @staticmethod
+    def _long_round_trip_signals(df: pd.DataFrame) -> dict:
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 2, bearish=3))
+        return confluence
+
+    @staticmethod
+    def _short_round_trip_signals(df: pd.DataFrame) -> dict:
+        confluence = _confluence_at(df, 0, bearish=3)
+        confluence.update(_confluence_at(df, 2, bullish=3))
+        return confluence
+
+    def test_zero_slippage_is_identical_to_legacy_for_every_direction(self):
+        df = _candles([99, 100, 99, 120, 121, 118, 125, 130])
+        confluence = self._mixed_signals(df)
+        cases = [
+            ("long", 1, 0.0),
+            ("short", 2, 0.01),
+            ("reverse", 2, 0.0),
+            ("reverse", 3, 0.015),
+            ("long", 3, 0.01),
+            ("short", 1, 0.005),
+        ]
+        for direction, threshold, fee_rate in cases:
+            with self.subTest(direction=direction, threshold=threshold, fee_rate=fee_rate):
+                legacy = simulate_wallet(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction,
+                )
+                explicit = simulate_wallet(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction, slippage_bps=0.0,
+                )
+                full = simulate_wallet_with_equity(
+                    df, confluence, threshold=threshold, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction, slippage_bps=0.0,
+                )
+
+                self.assertEqual(legacy, explicit)
+                self.assertEqual(len(explicit), 2)
+                self.assertEqual(legacy[0], full[0])
+                self.assertEqual(legacy[1], full[1])
+                self.assertEqual(len(full), 3)
+                self.assertEqual(
+                    [(t.action, t.time, t.price, t.fee_paid) for t in legacy[1]],
+                    [(t.action, t.time, t.price, t.fee_paid) for t in explicit[1]],
+                )
+
+    def test_long_entry_fills_higher_and_exit_fills_lower(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = self._long_round_trip_signals(df)
+
+        baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="long",
+        )
+        slipped, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="long", slippage_bps=100.0,  # 1%
+        )
+
+        self.assertEqual([t.action for t in trades], ["BUY", "SELL"])
+        self.assertAlmostEqual(trades[0].price, 101.0)       # 100 * 1.01 (adverse buy)
+        self.assertAlmostEqual(trades[1].price, 118.8)       # 120 * 0.99 (adverse sell)
+        # shares = 1000 / 101, then sold at 118.8.
+        self.assertAlmostEqual(slipped, (1000.0 / 101.0) * 118.8)
+        self.assertLess(slipped, baseline)
+
+    def test_short_entry_fills_lower_and_cover_fills_higher(self):
+        df = _candles([99, 100, 99, 80, 81])
+        confluence = self._short_round_trip_signals(df)
+
+        baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="short",
+        )
+        slipped, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="short", slippage_bps=100.0,
+        )
+
+        self.assertEqual([t.action for t in trades], ["SELL (short)", "BUY (cover)"])
+        self.assertAlmostEqual(trades[0].price, 99.0)        # 100 * 0.99 (adverse sell)
+        self.assertAlmostEqual(trades[1].price, 80.8)        # 80 * 1.01 (adverse buy)
+        # shares = 1000 / 99 shorted at 99; covered at 80.8. The wallet
+        # receives 1000 on entry and pays shares * 80.8 on cover.
+        self.assertAlmostEqual(slipped, 1000.0 + 1000.0 - (1000.0 / 99.0) * 80.8)
+        self.assertLess(slipped, baseline)
+
+    def test_always_adverse_never_improves_a_profitable_run(self):
+        # Both a profitable long (price up) and a profitable short (price
+        # down): any slippage must reduce the final value, never raise it.
+        long_df = _candles([99, 100, 99, 120, 121])
+        short_df = _candles([99, 100, 99, 80, 81])
+        cases = [
+            ("long", long_df, self._long_round_trip_signals(long_df)),
+            ("short", short_df, self._short_round_trip_signals(short_df)),
+        ]
+        for direction, df, confluence in cases:
+            with self.subTest(direction=direction):
+                baseline, _ = simulate_wallet(
+                    df, confluence, threshold=2, fee_rate=0.0,
+                    starting_cash=1000.0, direction=direction,
+                )
+                previous = baseline
+                for bps in (1.0, 10.0, 100.0, 500.0):
+                    slipped, _ = simulate_wallet(
+                        df, confluence, threshold=2, fee_rate=0.0,
+                        starting_cash=1000.0, direction=direction, slippage_bps=bps,
+                    )
+                    self.assertLess(slipped, previous, f"slippage {bps}bps was not adverse")
+                    previous = slipped
+
+    def test_reverse_long_to_short_flip_applies_slippage_to_every_fill(self):
+        # 4 paid fills: long entry (buy), flip sale (sell), flip short entry
+        # (sell), end-of-run cover (buy). Each must fill adversely.
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = self._long_round_trip_signals(df)
+
+        _, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse", slippage_bps=100.0,
+        )
+
+        self.assertEqual(
+            [t.action for t in trades],
+            ["BUY", "SELL", "SELL (short)", "BUY (cover liquidated at end)"],
+        )
+        self.assertAlmostEqual(trades[0].price, 100.0 * 1.01)  # entry buy
+        self.assertAlmostEqual(trades[1].price, 120.0 * 0.99)  # flip sell
+        self.assertAlmostEqual(trades[2].price, 120.0 * 0.99)  # flip short entry
+        self.assertAlmostEqual(trades[3].price, 121.0 * 1.01)  # liquidation cover
+
+    def test_reverse_short_to_long_flip_applies_slippage_to_every_fill(self):
+        df = _candles([99, 100, 99, 80, 81])
+        confluence = self._short_round_trip_signals(df)
+
+        _, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse", slippage_bps=100.0,
+        )
+
+        self.assertEqual(
+            [t.action for t in trades],
+            ["SELL (short)", "BUY (cover)", "BUY", "SELL (liquidated at end)"],
+        )
+        self.assertAlmostEqual(trades[0].price, 100.0 * 0.99)  # short entry sell
+        self.assertAlmostEqual(trades[1].price, 80.0 * 1.01)   # flip cover buy
+        self.assertAlmostEqual(trades[2].price, 80.0 * 1.01)   # flip long entry buy
+        self.assertAlmostEqual(trades[3].price, 81.0 * 0.99)   # liquidation sell
+
+    def test_combines_with_percentage_fee_on_the_same_notional(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = self._long_round_trip_signals(df)
+
+        baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="long",
+        )
+        slipped, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="long", slippage_bps=100.0,
+        )
+
+        # The percentage fee is still charged on the notional (not on the
+        # slipped execution price): entry fee = 1% * 1000 = 10, so shares =
+        # 990 / 101. The exit proceeds use the adverse 118.8 price and pay 1%.
+        buy_fee = 1000.0 * 0.01
+        shares = (1000.0 - buy_fee) / (100.0 * 1.01)
+        proceeds = shares * (120.0 * 0.99)
+        expected = proceeds - proceeds * 0.01
+
+        self.assertAlmostEqual(trades[0].fee_paid, buy_fee, places=10)
+        self.assertAlmostEqual(trades[1].fee_paid, proceeds * 0.01, places=10)
+        self.assertAlmostEqual(slipped, expected)
+        self.assertLess(slipped, baseline)
+
+    def test_combines_with_fee_fixed_and_percentage_fee_all_three_apply(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = self._long_round_trip_signals(df)
+
+        baseline, _ = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="long", fee_fixed=2.0,
+        )
+        combined, trades = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="long",
+            fee_fixed=2.0, slippage_bps=100.0,
+        )
+
+        # Same fixed (2 per fill) and percentage (1% of notional) fees as the
+        # baseline, with the two execution prices slipped adversely.
+        shares = (1000.0 - 10.0) / (100.0 * 1.01)
+        proceeds = shares * (120.0 * 0.99)
+        expected = proceeds - proceeds * 0.01 - 2.0 - 2.0
+        self.assertEqual(len(trades), 2)
+        self.assertAlmostEqual(trades[0].fee_paid, 10.0, places=10)
+        self.assertAlmostEqual(combined, expected)
+        self.assertLess(combined, baseline)
+
+    def test_simulate_wallet_keeps_two_tuple_and_matches_equity_variant(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = self._long_round_trip_signals(df)
+
+        result = simulate_wallet(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="reverse", slippage_bps=75.0,
+        )
+        full = simulate_wallet_with_equity(
+            df, confluence, threshold=2, fee_rate=0.01,
+            starting_cash=1000.0, direction="reverse", slippage_bps=75.0,
+        )
+
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], full[0])
+        self.assertEqual(result[1], full[1])
+
+    def test_default_calls_match_equity_variant_slice(self):
+        # With every new option left at its default, the 2-tuple wallet is
+        # exactly the first two elements of the equity variant.
+        df = _candles([99, 100, 99, 120, 121, 118, 125, 130])
+        confluence = self._mixed_signals(df)
+        for direction in ("long", "short", "reverse"):
+            with self.subTest(direction=direction):
+                wallet = simulate_wallet(
+                    df, confluence, threshold=2, fee_rate=0.01,
+                    starting_cash=1000.0, direction=direction,
+                )
+                full = simulate_wallet_with_equity(
+                    df, confluence, threshold=2, fee_rate=0.01,
+                    starting_cash=1000.0, direction=direction,
+                )
+                self.assertEqual(len(wallet), 2)
+                self.assertEqual(wallet, full[:2])
+
+    def test_backtest_symbol_and_run_backtest_forward_slippage_bps(self):
+        from unittest.mock import patch
+
+        df = _candles([99, 100, 99, 120, 121, 118, 125, 130])
+        fixed = self._mixed_signals(df)
+
+        class SlippageSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_slippage_fixed", lambda **kwargs: SlippageSignalProvider())
+
+        expected_cash, expected_trades = simulate_wallet(
+            df, fixed, threshold=2, fee_rate=0.0,
+            starting_cash=1000.0, direction="reverse", slippage_bps=50.0,
+        )
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[2], fee_rates=[0.0], direction="reverse",
+                signal_provider="test_slippage_fixed", slippage_bps=50.0,
+            )
+            frame = run_backtest(
+                symbols=["TEST"], start=df.index.min(), end=df.index.max(), interval="1h",
+                thresholds=[2], fee_rates=[0.0], direction="reverse",
+                signal_provider="test_slippage_fixed", slippage_bps=50.0,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertAlmostEqual(results[0].final_value, expected_cash)
+        self.assertEqual(
+            [(t.action, t.price) for t in results[0].trades],
+            [(t.action, t.price) for t in expected_trades],
+        )
+        self.assertEqual(len(frame), 1)
+        self.assertTrue(pd.isna(frame.iloc[0]["error"]))
+        self.assertAlmostEqual(frame.iloc[0]["final_value"], round(expected_cash, 2))
+
+
 if __name__ == "__main__":
     unittest.main()

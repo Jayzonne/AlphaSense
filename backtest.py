@@ -221,6 +221,17 @@ def main():
                         help="Annualized volatility target in percent, e.g. 10 (disabled by default)")
     parser.add_argument("--vol-lookback", type=int, default=20,
                         help="Rolling window in bars for realized volatility (default: 20)")
+    parser.add_argument("--entry-threshold", type=int, default=None,
+                        help="Entry threshold for signal count (hysteresis). Defaults to --threshold if not set.")
+    parser.add_argument("--exit-threshold", type=int, default=None,
+                        help="Exit/flip threshold for opposite signal count (hysteresis). Defaults to --entry-threshold/--threshold if not set.")
+    parser.add_argument("--fee-fixed", type=float, default=0.0,
+                        help="Fixed fee per fill in same currency as starting cash (default: 0.0)")
+    parser.add_argument("--slippage-bps", type=float, default=0.0,
+                        help="Slippage in basis points per fill (default: 0.0)")
+    parser.add_argument("--broker-preset", type=str, default=None,
+                        choices=["alpaca", "xtb", "ibkr", "ibkr-us-pro", "ibkr-eu-fixed", "degiro"],
+                        help="Apply indicative broker fee/slippage preset. Explicit flags override preset values.")
     args = parser.parse_args()
 
     if args.preset:
@@ -230,7 +241,24 @@ def main():
         start = datetime.strptime(args.start, "%Y-%m-%d") if args.start else end - timedelta(days=60)
         interval = args.interval
 
-    fee_rates = [f / 100 for f in args.fees] if args.fees else DEFAULT_FEE_RATES
+    # Resolve broker preset first to determine effective costs
+    from AlphaSense.costs.brokers import resolve_broker_preset
+    broker_label = None
+    if args.broker_preset is not None:
+        resolved_fee_pct_single, resolved_fee_fixed, resolved_slippage_bps, broker_label = resolve_broker_preset(
+            args.broker_preset,
+            args.fees[0] / 100 if args.fees and len(args.fees) > 0 else None,
+            args.fee_fixed if args.fee_fixed != 0.0 else None,
+            args.slippage_bps if args.slippage_bps != 0.0 else None,
+        )
+        fee_rates = [resolved_fee_pct_single]
+        fee_fixed_eff = resolved_fee_fixed
+        slippage_bps_eff = resolved_slippage_bps
+    else:
+        fee_rates = [f / 100 for f in args.fees] if args.fees else DEFAULT_FEE_RATES
+        fee_fixed_eff = args.fee_fixed
+        slippage_bps_eff = args.slippage_bps
+
     symbols = args.symbols or DEFAULT_SYMBOLS
     target_vol = None if args.target_vol is None else args.target_vol / 100.0
 
@@ -240,7 +268,18 @@ def main():
     )
     if target_vol is not None:
         header += f", target_vol={args.target_vol:.1f}% vol_lookback={args.vol_lookback}"
-    print(header)
+    if args.entry_threshold is not None or args.exit_threshold is not None:
+        header += f", entry_threshold={args.entry_threshold}, exit_threshold={args.exit_threshold}"
+    if args.broker_preset is not None:
+        header += f", broker={args.broker_preset}"
+        print(header)
+        print(f"Costs: fee_pct={fee_rates[0]*100:.3f}%, fee_fixed=${fee_fixed_eff:.2f}, slippage_bps={slippage_bps_eff:.1f}")
+    else:
+        if fee_fixed_eff != 0.0:
+            header += f", fee_fixed=${fee_fixed_eff:.2f}"
+        if slippage_bps_eff != 0.0:
+            header += f", slippage_bps={slippage_bps_eff:.1f}"
+        print(header)
 
     # Only tsmom understands --lookbacks. Gating here (rather than making every
     # provider factory swallow unknown kwargs) keeps each factory's signature
@@ -254,6 +293,10 @@ def main():
         direction=args.direction, signal_provider=args.signal_provider,
         provider_kwargs=provider_kwargs,
         target_vol=target_vol, vol_lookback=args.vol_lookback,
+        entry_threshold=args.entry_threshold, exit_threshold=args.exit_threshold,
+        fee_fixed=fee_fixed_eff,
+        slippage_bps=slippage_bps_eff,
+        broker_preset=None,
     )
 
     for symbol in results["symbol"].unique():

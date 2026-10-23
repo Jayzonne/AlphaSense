@@ -321,6 +321,34 @@ class TestVolatilityTargetCli(unittest.TestCase):
         self.assertIsNone(kwargs["target_vol"])
         self.assertEqual(kwargs["vol_lookback"], 20)
 
+    def test_hysteresis_thresholds_passed_and_announced(self):
+        out, kwargs = self._run_main(["--entry-threshold", "2", "--exit-threshold", "1"])
+        self.assertIn("entry_threshold=2, exit_threshold=1", out)
+        self.assertEqual(kwargs["entry_threshold"], 2)
+        self.assertEqual(kwargs["exit_threshold"], 1)
+
+    def test_hysteresis_single_entry_threshold(self):
+        out, kwargs = self._run_main(["--entry-threshold", "2"])
+        self.assertIn("entry_threshold=2, exit_threshold=None", out)
+        self.assertEqual(kwargs["entry_threshold"], 2)
+        self.assertIsNone(kwargs["exit_threshold"])
+
+    def test_header_unchanged_without_hysteresis(self):
+        out, kwargs = self._run_main([])
+        self.assertNotIn("entry_threshold", out)
+        self.assertIsNone(kwargs["entry_threshold"])
+        self.assertIsNone(kwargs["exit_threshold"])
+
+    def test_fee_fixed_passed_and_announced(self):
+        out, kwargs = self._run_main(["--fee-fixed", "1.0"])
+        self.assertIn("fee_fixed=$1.00", out)
+        self.assertEqual(kwargs["fee_fixed"], 1.0)
+
+    def test_header_unchanged_without_fee_fixed(self):
+        out, kwargs = self._run_main([])
+        self.assertNotIn("fee_fixed", out)
+        self.assertEqual(kwargs["fee_fixed"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

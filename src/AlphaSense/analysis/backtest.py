@@ -39,6 +39,7 @@ from AlphaSense.analysis import metrics
 from AlphaSense.analysis.confluence import compute_confluence
 from AlphaSense.analysis.signals import ConfluenceProvider, get_provider, register_provider
 from AlphaSense.requests.quotes import US_MEGACAPS, EU_MEGACAPS
+from AlphaSense.costs.brokers import resolve_broker_preset
 
 DEFAULT_SYMBOLS = [symbol for symbol, _ in US_MEGACAPS + EU_MEGACAPS]
 DEFAULT_THRESHOLDS = [1, 2, 3, 4]
@@ -193,6 +194,10 @@ def _simulate_wallet_full(
     vol_lookback: int = 20,
     fallback_fraction: float = 1.0,
     bars_per_year: float | None = None,
+    entry_threshold: int | None = None,
+    exit_threshold: int | None = None,
+    fee_fixed: float = 0.0,
+    slippage_bps: float = 0.0,
 ) -> tuple[float, list[Trade], pd.Series]:
     """
     Full simulation core: same trading rules as simulate_wallet(), plus the
@@ -213,9 +218,58 @@ def _simulate_wallet_full(
     fraction * cash, where fraction is derived from the realized volatility
     known at the signal bar. target_vol=None keeps the legacy fully-invested
     sizing exactly (fraction == 1.0 everywhere).
+
+    entry_threshold/exit_threshold implement threshold hysteresis: a new
+    position is opened only once the signal count reaches entry_threshold,
+    while an open position is closed (or flipped) only once the opposite
+    count reaches exit_threshold. Both default to `threshold`, which reproduces
+    the legacy single-threshold behaviour exactly. The two thresholds act
+    independently per direction (a long exit never depends on the long entry
+    count, and vice versa).
+
+    fee_fixed is an absolute fee (same currency as starting_cash) charged on
+    every paid fill: long/short entry, long exit/cover, each leg of a flip and
+    the end-of-run liquidation. It is deducted from cash in addition to the
+    existing percentage fee_rate fee, which stays applied to the notional.
+    Unlike that percentage fee, the absolute fee does not change the position
+    sizing: every fill costs exactly fee_fixed, so a run with N fills always
+    ends N * fee_fixed below the same run without the fixed fee.
+    fee_fixed=0.0 reproduces the legacy behaviour exactly.
+
+    slippage_bps models execution slippage in basis points (1 bp = 0.01%),
+    applied ONLY to the execution price and always adversely: a buy (long
+    entry, short cover) fills at price * (1 + slippage_bps / 10000), a sell
+    (long exit, short entry) fills at price * (1 - slippage_bps / 10000). It
+    applies to every paid fill - entries, exits, both legs of a flip and the
+    end-of-run liquidation - and is independent of both fee_rate (percentage
+    of notional) and fee_fixed (absolute per fill). slippage_bps=0.0 leaves
+    execution prices untouched, reproducing the legacy behaviour exactly.
     """
     if direction not in ("long", "short", "reverse"):
         raise ValueError(f"direction must be 'long', 'short' or 'reverse', got {direction!r}")
+    if slippage_bps < 0.0:
+        raise ValueError(f"slippage_bps must be >= 0, got {slippage_bps}")
+
+    slippage_fraction = slippage_bps / 10000.0
+
+    def _buy_price(price: float) -> float:
+        return price if slippage_bps == 0.0 else price * (1.0 + slippage_fraction)
+
+    def _sell_price(price: float) -> float:
+        return price if slippage_bps == 0.0 else price * (1.0 - slippage_fraction)
+
+    # Hysteresis thresholds are opt-in: None means "same as the legacy
+    # threshold". Validate only explicitly supplied values so that legacy
+    # calls (including any unusual historical `threshold` values) are
+    # unaffected.
+    if entry_threshold is not None and entry_threshold < 1:
+        raise ValueError(f"entry_threshold must be >= 1, got {entry_threshold}")
+    if exit_threshold is not None and exit_threshold < 1:
+        raise ValueError(f"exit_threshold must be >= 1, got {exit_threshold}")
+    if entry_threshold is None:
+        entry_threshold = threshold
+    if exit_threshold is None:
+        exit_threshold = threshold
 
     # Computed once for the whole run; fraction.iloc[i] is the sizing to use
     # for a signal computed from bar i (executed at bar i+1's open).
@@ -225,6 +279,10 @@ def _simulate_wallet_full(
 
     times = list(price_df.index)
     cash = starting_cash
+    # Cumulative absolute fees already charged. Adding them back when sizing a
+    # new position keeps fee_fixed purely additive (it never changes the
+    # notional, unlike the percentage fee which is part of it).
+    fixed_fees_paid = 0.0
     shares = 0.0  # positive = long, negative = short
     trades: list[Trade] = []
     equity_values: list[float] = []
@@ -244,101 +302,127 @@ def _simulate_wallet_full(
                 fraction = float(fractions.iloc[i])
 
                 if direction == "long":
-                    if shares == 0.0 and conf["bullish_count"] >= threshold and fraction > 0.0:
-                        notional = fraction * cash
+                    if shares == 0.0 and conf["bullish_count"] >= entry_threshold and fraction > 0.0:
+                        exec_price = _buy_price(execution_price)
+                        notional = fraction * (cash + fixed_fees_paid)
                         fee_paid = notional * fee_rate
-                        shares = (notional - fee_paid) / execution_price
-                        cash = cash - notional
-                        trades.append(Trade("BUY", execution_time, execution_price, fee_paid))
-                    elif shares > 0.0 and conf["bearish_count"] >= threshold:
-                        proceeds = shares * execution_price
+                        shares = (notional - fee_paid) / exec_price
+                        cash = cash - notional - fee_fixed
+                        fixed_fees_paid += fee_fixed
+                        trades.append(Trade("BUY", execution_time, exec_price, fee_paid))
+                    elif shares > 0.0 and conf["bearish_count"] >= exit_threshold:
+                        exec_price = _sell_price(execution_price)
+                        proceeds = shares * exec_price
                         fee_paid = proceeds * fee_rate
                         # Any cash left uninvested by volatility targeting stays
                         # in the wallet. When fraction == 1.0, cash is already
                         # 0 here, so this is exactly the legacy behaviour.
-                        cash = cash + proceeds - fee_paid
+                        cash = cash + proceeds - fee_paid - fee_fixed
+                        fixed_fees_paid += fee_fixed
                         shares = 0.0
-                        trades.append(Trade("SELL", execution_time, execution_price, fee_paid))
+                        trades.append(Trade("SELL", execution_time, exec_price, fee_paid))
                 elif direction == "short":
-                    if shares == 0.0 and conf["bearish_count"] >= threshold and fraction > 0.0:
+                    if shares == 0.0 and conf["bearish_count"] >= entry_threshold and fraction > 0.0:
                         # Sell short the fraction * cash worth of shares.
                         # We receive the sale proceeds in cash and hold a negative share
                         # position; fees are deducted from the proceeds.
-                        notional = fraction * cash
+                        exec_price = _sell_price(execution_price)
+                        notional = fraction * (cash + fixed_fees_paid)
                         fee_paid = notional * fee_rate
-                        shares = -notional / execution_price
-                        cash = cash + notional - fee_paid
-                        trades.append(Trade("SELL (short)", execution_time, execution_price, fee_paid))
-                    elif shares < 0.0 and conf["bullish_count"] >= threshold:
+                        shares = -notional / exec_price
+                        cash = cash + notional - fee_paid - fee_fixed
+                        fixed_fees_paid += fee_fixed
+                        trades.append(Trade("SELL (short)", execution_time, exec_price, fee_paid))
+                    elif shares < 0.0 and conf["bullish_count"] >= exit_threshold:
                         # Buy to cover: repurchase shares to close the short position.
-                        cover_cost = (-shares) * execution_price
+                        exec_price = _buy_price(execution_price)
+                        cover_cost = (-shares) * exec_price
                         fee_paid = cover_cost * fee_rate
-                        cash = cash - cover_cost - fee_paid
+                        cash = cash - cover_cost - fee_paid - fee_fixed
+                        fixed_fees_paid += fee_fixed
                         shares = 0.0
-                        trades.append(Trade("BUY (cover)", execution_time, execution_price, fee_paid))
+                        trades.append(Trade("BUY (cover)", execution_time, exec_price, fee_paid))
                 else:  # direction == "reverse"
-                    if shares == 0.0 and conf["bullish_count"] >= threshold and fraction > 0.0:
+                    if shares == 0.0 and conf["bullish_count"] >= entry_threshold and fraction > 0.0:
                         # Flat + bullish: go long, same sizing as the "long" direction.
-                        notional = fraction * cash
+                        exec_price = _buy_price(execution_price)
+                        notional = fraction * (cash + fixed_fees_paid)
                         fee_paid = notional * fee_rate
-                        shares = (notional - fee_paid) / execution_price
-                        cash = cash - notional
-                        trades.append(Trade("BUY", execution_time, execution_price, fee_paid))
-                    elif shares == 0.0 and conf["bearish_count"] >= threshold and fraction > 0.0:
+                        shares = (notional - fee_paid) / exec_price
+                        cash = cash - notional - fee_fixed
+                        fixed_fees_paid += fee_fixed
+                        trades.append(Trade("BUY", execution_time, exec_price, fee_paid))
+                    elif shares == 0.0 and conf["bearish_count"] >= entry_threshold and fraction > 0.0:
                         # Flat + bearish: go short, same sizing as the "short" direction.
-                        notional = fraction * cash
+                        exec_price = _sell_price(execution_price)
+                        notional = fraction * (cash + fixed_fees_paid)
                         fee_paid = notional * fee_rate
-                        shares = -notional / execution_price
-                        cash = cash + notional - fee_paid
-                        trades.append(Trade("SELL (short)", execution_time, execution_price, fee_paid))
-                    elif shares > 0.0 and conf["bearish_count"] >= threshold:
-                        # Long + bearish: sell the long position, then immediately sell
-                        # short with fraction * the resulting cash - both at the same
-                        # execution price. A zero fraction liquidates and stays flat,
-                        # without appending a zero-size entry trade.
-                        proceeds = shares * execution_price
+                        shares = -notional / exec_price
+                        cash = cash + notional - fee_paid - fee_fixed
+                        fixed_fees_paid += fee_fixed
+                        trades.append(Trade("SELL (short)", execution_time, exec_price, fee_paid))
+                    elif shares > 0.0 and conf["bearish_count"] >= exit_threshold:
+                        # Long + bearish: sell the long position, then - only if the
+                        # opposite signal also clears entry_threshold - immediately
+                        # sell short with fraction * the resulting cash. Both legs
+                        # are sells, so both fill at the (adverse) sell price. A zero
+                        # fraction, or a bearish count between exit_threshold and
+                        # entry_threshold, closes the long and stays flat without a
+                        # zero-size entry trade.
+                        exec_price = _sell_price(execution_price)
+                        proceeds = shares * exec_price
                         sell_fee_paid = proceeds * fee_rate
-                        cash = cash + proceeds - sell_fee_paid
+                        cash = cash + proceeds - sell_fee_paid - fee_fixed
+                        fixed_fees_paid += fee_fixed
                         shares = 0.0
-                        trades.append(Trade("SELL", execution_time, execution_price, sell_fee_paid))
+                        trades.append(Trade("SELL", execution_time, exec_price, sell_fee_paid))
 
-                        if fraction > 0.0:
-                            notional = fraction * cash
+                        if fraction > 0.0 and conf["bearish_count"] >= entry_threshold:
+                            notional = fraction * (cash + fixed_fees_paid)
                             short_fee_paid = notional * fee_rate
-                            shares = -notional / execution_price
-                            cash = cash + notional - short_fee_paid
-                            trades.append(Trade("SELL (short)", execution_time, execution_price, short_fee_paid))
-                    elif shares < 0.0 and conf["bullish_count"] >= threshold:
-                        # Short + bullish: cover the short position, then immediately
-                        # buy long with fraction * the resulting cash - both at the
-                        # same execution price. A zero fraction covers and stays flat,
-                        # without appending a zero-size entry trade.
-                        cover_cost = (-shares) * execution_price
+                            shares = -notional / exec_price
+                            cash = cash + notional - short_fee_paid - fee_fixed
+                            fixed_fees_paid += fee_fixed
+                            trades.append(Trade("SELL (short)", execution_time, exec_price, short_fee_paid))
+                    elif shares < 0.0 and conf["bullish_count"] >= exit_threshold:
+                        # Short + bullish: cover the short position, then - only if
+                        # the opposite signal also clears entry_threshold -
+                        # immediately buy long with fraction * the resulting cash.
+                        # Both legs are buys, so both fill at the (adverse) buy
+                        # price. A zero fraction, or a bullish count between
+                        # exit_threshold and entry_threshold, covers the short and
+                        # stays flat without a zero-size entry trade.
+                        exec_price = _buy_price(execution_price)
+                        cover_cost = (-shares) * exec_price
                         cover_fee_paid = cover_cost * fee_rate
-                        cash = cash - cover_cost - cover_fee_paid
+                        cash = cash - cover_cost - cover_fee_paid - fee_fixed
+                        fixed_fees_paid += fee_fixed
                         shares = 0.0
-                        trades.append(Trade("BUY (cover)", execution_time, execution_price, cover_fee_paid))
+                        trades.append(Trade("BUY (cover)", execution_time, exec_price, cover_fee_paid))
 
-                        if fraction > 0.0:
-                            notional = fraction * cash
+                        if fraction > 0.0 and conf["bullish_count"] >= entry_threshold:
+                            notional = fraction * (cash + fixed_fees_paid)
                             buy_fee_paid = notional * fee_rate
-                            shares = (notional - buy_fee_paid) / execution_price
-                            cash = cash - notional
-                            trades.append(Trade("BUY", execution_time, execution_price, buy_fee_paid))
+                            shares = (notional - buy_fee_paid) / exec_price
+                            cash = cash - notional - fee_fixed
+                            fixed_fees_paid += fee_fixed
+                            trades.append(Trade("BUY", execution_time, exec_price, buy_fee_paid))
 
             equity_values.append(cash + shares * float(price_df["close"].iloc[t]))
 
         if shares > 0.0:
-            last_price = float(price_df["close"].iloc[-1])
+            last_price = _sell_price(float(price_df["close"].iloc[-1]))
             proceeds = shares * last_price
             fee_paid = proceeds * fee_rate
-            cash = cash + proceeds - fee_paid
+            cash = cash + proceeds - fee_paid - fee_fixed
+            fixed_fees_paid += fee_fixed
             trades.append(Trade("SELL (liquidated at end)", times[-1], last_price, fee_paid))
         elif shares < 0.0:
-            last_price = float(price_df["close"].iloc[-1])
+            last_price = _buy_price(float(price_df["close"].iloc[-1]))
             cover_cost = (-shares) * last_price
             fee_paid = cover_cost * fee_rate
-            cash = cash - cover_cost - fee_paid
+            cash = cash - cover_cost - fee_paid - fee_fixed
+            fixed_fees_paid += fee_fixed
             trades.append(Trade("BUY (cover liquidated at end)", times[-1], last_price, fee_paid))
 
         # The run ends fully in cash: make the last curve point exact.
@@ -359,6 +443,10 @@ def simulate_wallet(
     vol_lookback: int = 20,
     fallback_fraction: float = 1.0,
     bars_per_year: float | None = None,
+    entry_threshold: int | None = None,
+    exit_threshold: int | None = None,
+    fee_fixed: float = 0.0,
+    slippage_bps: float = 0.0,
 ) -> tuple[float, list[Trade]]:
     """
     Pure simulation core (no I/O, fully deterministic given its inputs - the
@@ -387,11 +475,25 @@ def simulate_wallet(
     target_vol/vol_lookback/fallback_fraction/bars_per_year opt into
     volatility-targeted sizing (see _vol_target_fraction_series); leaving
     target_vol=None keeps the exact legacy behaviour.
+
+    entry_threshold/exit_threshold opt into threshold hysteresis (see
+    _simulate_wallet_full); leaving both None reproduces the legacy
+    single-threshold rules exactly.
+
+    fee_fixed is an absolute fee charged on every paid fill (see
+    _simulate_wallet_full); leaving it at 0.0 reproduces the legacy behaviour
+    exactly. It combines with fee_rate, which stays a percentage of notional.
+
+    slippage_bps applies adverse execution slippage to every paid fill (see
+    _simulate_wallet_full); leaving it at 0.0 reproduces the legacy behaviour
+    exactly. It is independent of both fee mechanisms.
     """
     cash, trades, _ = _simulate_wallet_full(
         price_df, confluence, threshold, fee_rate, starting_cash, direction,
         target_vol=target_vol, vol_lookback=vol_lookback,
         fallback_fraction=fallback_fraction, bars_per_year=bars_per_year,
+        entry_threshold=entry_threshold, exit_threshold=exit_threshold,
+        fee_fixed=fee_fixed, slippage_bps=slippage_bps,
     )
     return cash, trades
 
@@ -407,6 +509,10 @@ def simulate_wallet_with_equity(
     vol_lookback: int = 20,
     fallback_fraction: float = 1.0,
     bars_per_year: float | None = None,
+    entry_threshold: int | None = None,
+    exit_threshold: int | None = None,
+    fee_fixed: float = 0.0,
+    slippage_bps: float = 0.0,
 ) -> tuple[float, list[Trade], pd.Series]:
     """
     Same signature and trading rules as simulate_wallet(), but also returns
@@ -418,6 +524,8 @@ def simulate_wallet_with_equity(
         price_df, confluence, threshold, fee_rate, starting_cash, direction,
         target_vol=target_vol, vol_lookback=vol_lookback,
         fallback_fraction=fallback_fraction, bars_per_year=bars_per_year,
+        entry_threshold=entry_threshold, exit_threshold=exit_threshold,
+        fee_fixed=fee_fixed, slippage_bps=slippage_bps,
     )
 
 
@@ -487,6 +595,10 @@ def backtest_symbol(
     provider_kwargs: dict | None = None,
     target_vol: float | None = None,
     vol_lookback: int = 20,
+    entry_threshold: int | None = None,
+    exit_threshold: int | None = None,
+    fee_fixed: float = 0.0,
+    slippage_bps: float = 0.0,
 ) -> list[BacktestResult]:
     """
     Fetches price data and computes the selected signal ONCE for this symbol,
@@ -507,6 +619,15 @@ def backtest_symbol(
     threshold x fee combination and concatenates the results.
     When direction="reverse", runs a single simulation that flips directly
     between long and short positions.
+
+    entry_threshold/exit_threshold are forwarded to the simulation core
+    unchanged (None keeps the legacy single-threshold rules).
+
+    fee_fixed is forwarded to every simulation unchanged (0.0 keeps the legacy
+    percentage-only fee behaviour).
+
+    slippage_bps is forwarded to every simulation unchanged (0.0 keeps the
+    legacy no-slippage behaviour).
     """
     if direction not in ("long", "short", "both", "reverse"):
         raise ValueError(f"direction must be 'long', 'short', 'both' or 'reverse', got {direction!r}")
@@ -568,6 +689,8 @@ def backtest_symbol(
                     df, confluence, threshold, fee_rate, starting_cash, dir_,
                     target_vol=target_vol, vol_lookback=vol_lookback,
                     bars_per_year=bars_per_year,
+                    entry_threshold=entry_threshold, exit_threshold=exit_threshold,
+                    fee_fixed=fee_fixed, slippage_bps=slippage_bps,
                 )
                 results.append(BacktestResult(
                     symbol, threshold, fee_rate, starting_cash, final_value, dir_, trades,
@@ -593,6 +716,11 @@ def run_backtest(
     equity_out: dict | None = None,
     target_vol: float | None = None,
     vol_lookback: int = 20,
+    entry_threshold: int | None = None,
+    exit_threshold: int | None = None,
+    fee_fixed: float = 0.0,
+    slippage_bps: float = 0.0,
+    broker_preset: str | None = None,
 ) -> pd.DataFrame:
     """
     Runs backtest_symbol() across a list of symbols (default: the curated
@@ -604,7 +732,52 @@ def run_backtest(
     equity_out (optional) is filled in-place with the per-run equity curves,
     keyed by (symbol, direction, threshold, fee_pct). The curves are kept out
     of the returned DataFrame, which stays flat and cheap to aggregate.
+
+    entry_threshold/exit_threshold are passed through unchanged to every
+    backtest_symbol() call (None keeps the legacy single-threshold rules).
+
+    fee_fixed is passed through unchanged to every backtest_symbol() call
+    (0.0 keeps the legacy percentage-only fee behaviour).
+
+    slippage_bps is passed through unchanged to every backtest_symbol() call
+    (0.0 keeps the legacy no-slippage behaviour).
+
+    broker_preset applies indicative broker costs with precedence:
+    explicit fee_rates/fee_fixed/slippage_bps override preset values.
     """
+    # Resolve broker preset with precedence: explicit args override preset
+    fee_rates_resolved = fee_rates
+    fee_fixed_resolved = fee_fixed
+    slippage_bps_resolved = slippage_bps
+    if broker_preset is not None:
+        # Determine if user passed explicit values (non-default)
+        explicit_fee_pct = fee_rates is not None
+        explicit_fee_fixed = fee_fixed != 0.0
+        explicit_slippage = slippage_bps != 0.0
+        # For fee_rates, if None use defaults later; treat as explicit only if passed
+        preset_fee_pct = None if explicit_fee_pct else None
+        preset_fee_fixed = None if explicit_fee_fixed else None
+        preset_slippage = None if explicit_slippage else None
+        # Better: pass None for non-explicit to let resolver use preset
+        p_fee_pct = None if fee_rates is None else fee_rates[0] if isinstance(fee_rates, (list, tuple)) and len(fee_rates) > 0 else (fee_rates if not isinstance(fee_rates, (list, tuple)) else None)
+        # Simpler approach: resolve per-value
+        resolved_fee_pct_single, resolved_fee_fixed, resolved_slippage_bps, _label = resolve_broker_preset(
+            broker_preset,
+            fee_rates[0] if isinstance(fee_rates, (list, tuple)) and len(fee_rates) > 0 else (fee_rates if isinstance(fee_rates, (int, float)) and not isinstance(fee_rates, bool) else None),
+            fee_fixed if fee_fixed != 0.0 else None,
+            slippage_bps if slippage_bps != 0.0 else None,
+        )
+        if fee_rates is None:
+            fee_rates_resolved = [resolved_fee_pct_single]
+        else:
+            fee_rates_resolved = fee_rates
+        fee_fixed_resolved = resolved_fee_fixed
+        slippage_bps_resolved = resolved_slippage_bps
+    else:
+        fee_rates_resolved = fee_rates
+        fee_fixed_resolved = fee_fixed
+        slippage_bps_resolved = slippage_bps
+
     symbols = symbols or DEFAULT_SYMBOLS
     end = end or datetime.now()
     start = start or (end - timedelta(days=60))
@@ -613,9 +786,11 @@ def run_backtest(
     for symbol in symbols:
         try:
             results = backtest_symbol(
-                symbol, start, end, interval, thresholds, fee_rates, starting_cash, direction,
+                symbol, start, end, interval, thresholds, fee_rates_resolved, starting_cash, direction,
                 signal_provider, provider_kwargs,
                 target_vol=target_vol, vol_lookback=vol_lookback,
+                entry_threshold=entry_threshold, exit_threshold=exit_threshold,
+                fee_fixed=fee_fixed_resolved, slippage_bps=slippage_bps_resolved,
             )
         except Exception as e:
             rows.append({"symbol": symbol, "threshold": None, "fee_pct": None, "direction": None, "error": str(e)})
