@@ -35,12 +35,18 @@ import pandas as pd
 
 from AlphaSense.frontend.data_access import get_price_candles_dataframe
 from AlphaSense.analysis.confluence import compute_confluence
+from AlphaSense.analysis.signals import ConfluenceProvider, get_provider, register_provider
 from AlphaSense.requests.quotes import US_MEGACAPS, EU_MEGACAPS
 
 DEFAULT_SYMBOLS = [symbol for symbol, _ in US_MEGACAPS + EU_MEGACAPS]
 DEFAULT_THRESHOLDS = [1, 2, 3, 4]
 DEFAULT_FEE_RATES = [0.0, 0.005, 0.01, 0.015]
 DEFAULT_STARTING_CASH = 1000.0
+DEFAULT_SIGNAL_PROVIDER = "confluence"
+
+# Existing callers/tests patch AlphaSense.analysis.backtest.compute_confluence;
+# resolve it at provider-build time so that patch point keeps working.
+register_provider("confluence", lambda **kwargs: ConfluenceProvider(compute_fn=compute_confluence, **kwargs))
 
 
 @dataclass
@@ -227,12 +233,23 @@ def backtest_symbol(
     fee_rates: list[float] = None,
     starting_cash: float = DEFAULT_STARTING_CASH,
     direction: str = "long",
+    signal_provider: str = DEFAULT_SIGNAL_PROVIDER,
+    provider_kwargs: dict | None = None,
 ) -> list[BacktestResult]:
     """
-    Fetches price data and computes confluence ONCE for this symbol, then
-    cheaply re-runs simulate_wallet() for every threshold x fee combination
-    on that same in-memory result - one DB/API round trip per symbol
-    regardless of how many threshold/fee combinations are swept.
+    Fetches price data and computes the selected signal ONCE for this symbol,
+    then cheaply re-runs simulate_wallet() for every threshold x fee
+    combination on that same in-memory result - one DB/API round trip per
+    symbol regardless of how many threshold/fee combinations are swept.
+
+    signal_provider names a registered SignalProvider; the default
+    "confluence" preserves the original behaviour of using
+    compute_confluence() directly.
+
+    provider_kwargs (optional) is forwarded to that provider's factory. It
+    must contain only options the selected factory accepts - e.g.
+    {"lookbacks": [...]} for "tsmom" - because the engine intentionally does
+    not know provider-specific parameter names.
 
     When direction="both", runs both a long and a short simulation for each
     threshold x fee combination and concatenates the results.
@@ -250,7 +267,10 @@ def backtest_symbol(
         return []
     df = df.sort_index()
 
-    confluence = compute_confluence(symbol, df.index.min(), df.index.max(), interval, df)["confluence"]
+    provider = get_provider(
+        signal_provider, symbol, df.index.min(), df.index.max(), interval, **(provider_kwargs or {})
+    )
+    confluence = provider.build(df)
 
     results = []
     directions = ("long", "short") if direction == "both" else (direction,)
@@ -271,8 +291,16 @@ def run_backtest(
     fee_rates: list[float] = None,
     starting_cash: float = DEFAULT_STARTING_CASH,
     direction: str = "long",
+    signal_provider: str = DEFAULT_SIGNAL_PROVIDER,
+    provider_kwargs: dict | None = None,
 ) -> pd.DataFrame:
-    """ Runs backtest_symbol() across a list of symbols (default: the curated quick-list) and flattens the results into one long-format DataFrame. """
+    """
+    Runs backtest_symbol() across a list of symbols (default: the curated
+    quick-list) and flattens the results into one long-format DataFrame.
+
+    provider_kwargs is passed through unchanged to every backtest_symbol()
+    call, so all symbols in a run use the same provider configuration.
+    """
     symbols = symbols or DEFAULT_SYMBOLS
     end = end or datetime.now()
     start = start or (end - timedelta(days=60))
@@ -280,7 +308,10 @@ def run_backtest(
     rows = []
     for symbol in symbols:
         try:
-            results = backtest_symbol(symbol, start, end, interval, thresholds, fee_rates, starting_cash, direction)
+            results = backtest_symbol(
+                symbol, start, end, interval, thresholds, fee_rates, starting_cash, direction,
+                signal_provider, provider_kwargs,
+            )
         except Exception as e:
             rows.append({"symbol": symbol, "threshold": None, "fee_pct": None, "direction": None, "error": str(e)})
             continue

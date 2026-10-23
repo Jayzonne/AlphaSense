@@ -4,6 +4,14 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from AlphaSense.analysis.backtest import BacktestResult, simulate_wallet
+from AlphaSense.analysis.confluence import compute_confluence
+from AlphaSense.analysis.signals import (
+    ConfluenceProvider,
+    TrendProvider,
+    available_providers,
+    get_provider,
+    register_provider,
+)
 
 
 def _candles(prices: list[float]) -> pd.DataFrame:
@@ -364,6 +372,206 @@ class TestRunBacktestErrorHandling(unittest.TestCase):
         directions = set(df["direction"].dropna())
         self.assertEqual(directions, {"long", "short"})
         self.assertTrue(all(df["error"].isna()))
+
+
+class TestSignalProviders(unittest.TestCase):
+    def test_registered_provider_can_be_injected_without_core_edits(self):
+        from unittest.mock import patch
+        from AlphaSense.analysis.backtest import backtest_symbol
+
+        df = pd.DataFrame({
+            "open": [99, 100, 99, 120, 121],
+            "high": [100, 101, 100, 121, 122],
+            "low": [98, 99, 98, 119, 120],
+            "close": [99, 100, 99, 120, 121],
+        }, index=pd.date_range("2026-01-01", periods=5, freq="h"))
+        fixed = _confluence_at(df, 0, bullish=3)
+        fixed.update(_confluence_at(df, 2, bearish=3))
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_fixed", lambda **kwargs: FixedSignalProvider())
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df), \
+             patch("AlphaSense.analysis.backtest.compute_confluence", return_value={"confluence": {}}):
+            injected = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[2], fee_rates=[0.0], signal_provider="test_fixed",
+            )
+            default = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[2], fee_rates=[0.0],
+            )
+
+        # The injected provider's fixed signals drive the simulation...
+        self.assertEqual(len(injected), 1)
+        self.assertAlmostEqual(injected[0].final_value, 1200.0)
+        self.assertEqual([t.action for t in injected[0].trades], ["BUY", "SELL"])
+        # ...while the default (patched-empty) confluence produces no trades,
+        # proving the backtest engine actually consulted the selected provider.
+        self.assertEqual(default[0].trades, [])
+        self.assertEqual(default[0].final_value, 1000.0)
+
+    def test_confluence_provider_matches_compute_confluence(self):
+        df = _candles([100 + i for i in range(10)])
+        provider = ConfluenceProvider("TEST", df.index.min(), df.index.max(), "1h")
+
+        expected = compute_confluence("TEST", df.index.min(), df.index.max(), "1h", df)["confluence"]
+
+        self.assertEqual(provider.build(df), expected)
+
+    def test_default_signal_provider_name_resolves_to_confluence(self):
+        start = datetime(2026, 1, 1)
+        end = datetime(2026, 1, 2)
+
+        self.assertIn("confluence", available_providers())
+        self.assertIsInstance(get_provider("confluence", "TEST", start, end, "1h"), ConfluenceProvider)
+
+
+class TestTrendProvider(unittest.TestCase):
+    def _provider(self, lookbacks=(1,), interval: str = "1h") -> TrendProvider:
+        start = datetime(2026, 1, 1)
+        end = datetime(2026, 1, 2)
+        return TrendProvider("TEST", start, end, interval, lookbacks=lookbacks)
+
+    def test_build_emits_the_standard_shape_with_correct_counts(self):
+        up_df = _candles([100, 101, 102, 103])
+        up = self._provider().build(up_df)
+        self.assertEqual(set(up), {pd.Timestamp(ts).isoformat() for ts in up_df.index})
+        self.assertEqual(
+            up[pd.Timestamp(up_df.index[2]).isoformat()],
+            {"bullish_count": 1, "bearish_count": 0,
+             "bullish_sources": ["tsmom"], "bearish_sources": []},
+        )
+
+        down_df = _candles([103, 102, 101, 100])
+        down = self._provider().build(down_df)
+        self.assertEqual(
+            down[pd.Timestamp(down_df.index[2]).isoformat()],
+            {"bullish_count": 0, "bearish_count": 1,
+             "bullish_sources": [], "bearish_sources": ["tsmom"]},
+        )
+
+        # A flat return is neither bullish nor bearish.
+        flat_df = _candles([100, 100, 100, 100])
+        flat = self._provider().build(flat_df)
+        self.assertEqual(
+            flat[pd.Timestamp(flat_df.index[2]).isoformat()],
+            {"bullish_count": 0, "bearish_count": 0,
+             "bullish_sources": [], "bearish_sources": []},
+        )
+
+    def test_warm_up_bars_before_the_first_lookback_are_flat(self):
+        df = _candles([100 + i for i in range(12)])
+        signals = self._provider(lookbacks=(5,)).build(df)
+
+        flat = {"bullish_count": 0, "bearish_count": 0,
+                "bullish_sources": [], "bearish_sources": []}
+        for i in range(5):
+            self.assertEqual(signals[pd.Timestamp(df.index[i]).isoformat()], flat)
+        # Bar 5 is the first with a full lookback available.
+        self.assertEqual(
+            signals[pd.Timestamp(df.index[5]).isoformat()],
+            {"bullish_count": 1, "bearish_count": 0,
+             "bullish_sources": ["tsmom"], "bearish_sources": []},
+        )
+
+    def test_no_lookahead_uses_close_i_not_close_i_plus_one(self):
+        # With L=2, bar 2's true return is close[2]/close[0] = 150/100 (+50%).
+        # A future-shifted implementation reading close[3]/close[1] = 100/200
+        # (-50%) would flip the vote to bearish, so this catches lookahead.
+        df = _candles([100, 200, 150, 100, 90])
+        signals = self._provider(lookbacks=(2,)).build(df)
+
+        self.assertEqual(
+            signals[pd.Timestamp(df.index[2]).isoformat()],
+            {"bullish_count": 1, "bearish_count": 0,
+             "bullish_sources": ["tsmom"], "bearish_sources": []},
+        )
+        # Bar 3 correctly uses close[3]/close[1] = 100/200 (-50%), not
+        # close[4]/close[2] or close[3]/close[0].
+        self.assertEqual(
+            signals[pd.Timestamp(df.index[3]).isoformat()],
+            {"bullish_count": 0, "bearish_count": 1,
+             "bullish_sources": [], "bearish_sources": ["tsmom"]},
+        )
+
+    def test_ensemble_two_up_one_down_is_bullish(self):
+        # At bar 3: L1 60/40 up, L2 60/50 up, L3 60/100 down -> majority up.
+        df = _candles([100, 50, 40, 60])
+        signals = self._provider(lookbacks=(1, 2, 3)).build(df)
+        self.assertEqual(
+            signals[pd.Timestamp(df.index[3]).isoformat()],
+            {"bullish_count": 1, "bearish_count": 0,
+             "bullish_sources": ["tsmom"], "bearish_sources": []},
+        )
+
+    def test_ensemble_one_up_two_down_is_bearish(self):
+        # At bar 3: L1 61/60 up, L2 61/90 down, L3 61/100 down -> majority down.
+        df = _candles([100, 90, 60, 61])
+        signals = self._provider(lookbacks=(1, 2, 3)).build(df)
+        self.assertEqual(
+            signals[pd.Timestamp(df.index[3]).isoformat()],
+            {"bullish_count": 0, "bearish_count": 1,
+             "bullish_sources": [], "bearish_sources": ["tsmom"]},
+        )
+
+    def test_ensemble_tie_is_flat(self):
+        # At bar 2: L1 60/50 up, L2 60/100 down -> 1-1 tie means flat.
+        df = _candles([100, 50, 60])
+        signals = self._provider(lookbacks=(1, 2)).build(df)
+        self.assertEqual(
+            signals[pd.Timestamp(df.index[2]).isoformat()],
+            {"bullish_count": 0, "bearish_count": 0,
+             "bullish_sources": [], "bearish_sources": []},
+        )
+
+    def test_tsmom_is_registered_and_resolves_to_trend_provider(self):
+        start = datetime(2026, 1, 1)
+        end = datetime(2026, 1, 2)
+
+        self.assertIn("tsmom", available_providers())
+        provider = get_provider("tsmom", "TEST", start, end, "1d")
+        self.assertIsInstance(provider, TrendProvider)
+        # Defaults are exactly 1/3/12 months in daily bars.
+        self.assertEqual(provider.lookbacks, (21, 63, 252))
+
+        # Explicit lookbacks are forwarded by get_provider and stay literal.
+        custom = get_provider("tsmom", "TEST", start, end, "1h", lookbacks=(5, 10))
+        self.assertEqual(custom.lookbacks, (5, 10))
+
+    def test_default_lookbacks_scale_with_the_bar_interval(self):
+        start = datetime(2026, 1, 1)
+        end = datetime(2026, 1, 2)
+
+        daily = TrendProvider("TEST", start, end, "1d")
+        weekly = TrendProvider("TEST", start, end, "1wk")
+        self.assertEqual(daily.lookbacks, (21, 63, 252))
+        # 21 daily bars / 5 weekly bars per month = 3 bars per month.
+        self.assertEqual(weekly.lookbacks, (3, 9, 36))
+
+    def test_backtest_symbol_tsmom_direction_both_produces_long_and_short_rows(self):
+        from unittest.mock import patch
+        from AlphaSense.analysis.backtest import backtest_symbol
+
+        # 50 bars up, then 50 bars down: the up leg produces bullish TSMOM
+        # signals and the down leg bearish ones, so both directions trade.
+        prices = [100 + i for i in range(50)] + [149 - i for i in range(1, 51)]
+        df = _candles(prices)
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[1], fee_rates=[0.0], direction="both",
+                signal_provider="tsmom", provider_kwargs={"lookbacks": [21, 63]},
+            )
+
+        self.assertEqual({r.direction for r in results}, {"long", "short"})
+        by_direction = {r.direction: r for r in results}
+        self.assertTrue(by_direction["long"].trades)
+        self.assertTrue(by_direction["short"].trades)
 
 
 if __name__ == "__main__":
