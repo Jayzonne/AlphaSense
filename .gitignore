@@ -380,3 +380,11 @@ lib64
 bin/
 pyvenv.cfg
 # End of https://www.toptal.com/developers/gitignore/api/python,node,linux,archlinuxpackages,windows
+
+# Folder used for project tracking in local
+kanban
+.agentkanban
+.vscode
+.mcp.json
+AGENTS.md
+strategy_descriptions

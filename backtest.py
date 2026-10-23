@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from AlphaSense.analysis.backtest import run_backtest, DEFAULT_SYMBOLS, DEFAULT_THRESHOLDS, DEFAULT_FEE_RATES
+from AlphaSense.analysis.signals import available_providers
 from AlphaSense.frontend.data_access import RANGE_PRESETS, resolve_range_preset
 
 
@@ -113,6 +114,12 @@ def main():
                         help="Trade direction: long (buy on bullish, sell on bearish), short (sell short on bearish, "
                              "cover on bullish), both (run long and short simulations), or reverse (flip directly "
                              "between long and short on opposite signals) (default: long)")
+    parser.add_argument("--signal-provider", type=str, default="confluence", choices=available_providers(),
+                        help="Signal source to backtest (default: confluence)")
+    parser.add_argument("--lookbacks", nargs="+", type=int, default=[21, 63, 252],
+                        help="TSMOM lookback windows in bars, e.g. 21 63 252 "
+                             "(default: 21 63 252 = 1/3/12 months at 1d); only used with "
+                             "--signal-provider tsmom")
     args = parser.parse_args()
 
     if args.preset:
@@ -128,10 +135,17 @@ def main():
     print(f"Backtesting {len(symbols)} symbol(s), {start.date()} to {end.date()}, interval={interval}, "
           f"starting cash=${args.starting_cash:.2f}, direction={args.direction}")
 
+    # Only tsmom understands --lookbacks. Gating here (rather than making every
+    # provider factory swallow unknown kwargs) keeps each factory's signature
+    # honest while still passing the value through the generic
+    # provider_kwargs channel in run_backtest/backtest_symbol.
+    provider_kwargs = {"lookbacks": args.lookbacks} if args.signal_provider == "tsmom" else None
+
     results = run_backtest(
         symbols=symbols, start=start, end=end, interval=interval,
         thresholds=args.thresholds, fee_rates=fee_rates, starting_cash=args.starting_cash,
-        direction=args.direction,
+        direction=args.direction, signal_provider=args.signal_provider,
+        provider_kwargs=provider_kwargs,
     )
 
     for symbol in results["symbol"].unique():

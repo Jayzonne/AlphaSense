@@ -84,6 +84,11 @@ RANGE_PRESETS = {
     "1M": (timedelta(days=30), "1h"),
     "YTD": (None, "1d"),  # start of the current calendar year - handled specially below
     "1Y": (timedelta(days=365), "1d"),
+    # 2Y stays on daily bars (not weekly) so it can feed daily strategies that
+    # need >252 bars of warm-up (e.g. the TSMOM 12-month lookback). Yahoo's
+    # daily feed serves this range comfortably (~500 bars), unlike its 60m feed
+    # which caps at ~730 days.
+    "2Y": (timedelta(days=2 * 365), "1d"),
     "5Y": (timedelta(days=5 * 365), "1wk"),
     "MAX": (timedelta(days=20 * 365), "1mo"),  # RequestData has no "earliest available" concept, so this is a generous proxy for it rather than a true max
 }
