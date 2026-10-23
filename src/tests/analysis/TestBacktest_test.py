@@ -5,11 +5,16 @@ import numpy as np
 import pandas as pd
 
 from AlphaSense.analysis.backtest import (
+    DEFAULT_SYMBOLS,
+    DEFAULT_SYMBOLS_EU,
+    DEFAULT_SYMBOLS_US,
+    UNIVERSES,
     BacktestResult,
     _vol_target_fraction_series,
     backtest_symbol,
     buy_and_hold_equity_curve,
     buy_and_hold_value,
+    get_universe_symbols,
     run_backtest,
     simulate_wallet,
     simulate_wallet_with_equity,
@@ -1963,6 +1968,63 @@ class TestSlippageCostModel(unittest.TestCase):
         self.assertEqual(len(frame), 1)
         self.assertTrue(pd.isna(frame.iloc[0]["error"]))
         self.assertAlmostEqual(frame.iloc[0]["final_value"], round(expected_cash, 2))
+
+
+class TestSymbolUniverse(unittest.TestCase):
+    def test_us_and_eu_universes_are_non_empty_and_disjoint(self):
+        self.assertTrue(DEFAULT_SYMBOLS_US)
+        self.assertTrue(DEFAULT_SYMBOLS_EU)
+        self.assertEqual(set(DEFAULT_SYMBOLS_US) & set(DEFAULT_SYMBOLS_EU), set())
+
+    def test_all_universe_is_the_ordered_union_of_us_and_eu(self):
+        self.assertEqual(DEFAULT_SYMBOLS, DEFAULT_SYMBOLS_US + DEFAULT_SYMBOLS_EU)
+        self.assertEqual(UNIVERSES, {"all": DEFAULT_SYMBOLS, "us": DEFAULT_SYMBOLS_US, "eu": DEFAULT_SYMBOLS_EU})
+
+    def test_us_and_eu_tickers_follow_yahoo_suffix_conventions(self):
+        # US listings are bare tickers (BRK-B is a dash, not a dot); European
+        # listings carry an exchange suffix, e.g. ASML.AS / SAP.DE.
+        for symbol in DEFAULT_SYMBOLS_US:
+            self.assertNotIn(".", symbol, f"{symbol} looks like an EU ticker")
+        for symbol in DEFAULT_SYMBOLS_EU:
+            self.assertIn(".", symbol, f"{symbol} is missing an exchange suffix")
+
+    def test_get_universe_symbols_returns_a_copy(self):
+        symbols = get_universe_symbols("us")
+        symbols.append("ZZZ")
+        self.assertNotIn("ZZZ", DEFAULT_SYMBOLS_US)
+
+    def test_get_universe_symbols_rejects_unknown_universe(self):
+        with self.assertRaises(ValueError) as ctx:
+            get_universe_symbols("asia")
+        self.assertIn("asia", str(ctx.exception))
+
+    def test_run_backtest_universe_us_limits_symbols(self):
+        from unittest.mock import patch
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=pd.DataFrame()):
+            df = run_backtest(thresholds=[1], fee_rates=[0.0], universe="us")
+        self.assertEqual(list(dict.fromkeys(df["symbol"])), DEFAULT_SYMBOLS_US)
+
+    def test_run_backtest_universe_eu_limits_symbols(self):
+        from unittest.mock import patch
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=pd.DataFrame()):
+            df = run_backtest(thresholds=[1], fee_rates=[0.0], universe="eu")
+        self.assertEqual(list(dict.fromkeys(df["symbol"])), DEFAULT_SYMBOLS_EU)
+
+    def test_explicit_symbols_override_universe(self):
+        from unittest.mock import patch
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=pd.DataFrame()):
+            df = run_backtest(symbols=["AAPL"], thresholds=[1], fee_rates=[0.0], universe="eu")
+        self.assertEqual(list(df["symbol"]), ["AAPL"])
+
+    def test_default_universe_is_all(self):
+        from unittest.mock import patch
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=pd.DataFrame()):
+            df = run_backtest(thresholds=[1], fee_rates=[0.0])
+        self.assertEqual(list(dict.fromkeys(df["symbol"])), DEFAULT_SYMBOLS)
 
 
 if __name__ == "__main__":

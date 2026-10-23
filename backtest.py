@@ -32,7 +32,13 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from AlphaSense.analysis.backtest import run_backtest, DEFAULT_SYMBOLS, DEFAULT_THRESHOLDS, DEFAULT_FEE_RATES
+from AlphaSense.analysis.backtest import (
+    run_backtest,
+    DEFAULT_SYMBOLS,
+    DEFAULT_THRESHOLDS,
+    DEFAULT_FEE_RATES,
+    get_universe_symbols,
+)
 from AlphaSense.analysis.signals import available_providers
 from AlphaSense.frontend.data_access import RANGE_PRESETS, resolve_range_preset
 
@@ -232,6 +238,8 @@ def main():
     parser.add_argument("--broker-preset", type=str, default=None,
                         choices=["alpaca", "xtb", "ibkr", "ibkr-us-pro", "ibkr-eu-fixed", "degiro"],
                         help="Apply indicative broker fee/slippage preset. Explicit flags override preset values.")
+    parser.add_argument("--universe", type=str, default="all", choices=["all", "us", "eu"],
+                        help="Default symbol universe when --symbols is not given (default: all).")
     args = parser.parse_args()
 
     if args.preset:
@@ -259,13 +267,16 @@ def main():
         fee_fixed_eff = args.fee_fixed
         slippage_bps_eff = args.slippage_bps
 
-    symbols = args.symbols or DEFAULT_SYMBOLS
+    # An explicit --symbols list always wins over the universe selection.
+    symbols = args.symbols or get_universe_symbols(args.universe)
     target_vol = None if args.target_vol is None else args.target_vol / 100.0
 
     header = (
         f"Backtesting {len(symbols)} symbol(s), {start.date()} to {end.date()}, interval={interval}, "
         f"starting cash=${args.starting_cash:.2f}, direction={args.direction}"
     )
+    if not args.symbols and args.universe != "all":
+        header += f", universe={args.universe}"
     if target_vol is not None:
         header += f", target_vol={args.target_vol:.1f}% vol_lookback={args.vol_lookback}"
     if args.entry_threshold is not None or args.exit_threshold is not None:

@@ -41,7 +41,29 @@ from AlphaSense.analysis.signals import ConfluenceProvider, get_provider, regist
 from AlphaSense.requests.quotes import US_MEGACAPS, EU_MEGACAPS
 from AlphaSense.costs.brokers import resolve_broker_preset
 
-DEFAULT_SYMBOLS = [symbol for symbol, _ in US_MEGACAPS + EU_MEGACAPS]
+# Region-split default universes. Kept explicit (rather than derived inline)
+# so callers and tests can reason about "US", "EU" and "ALL" independently.
+DEFAULT_SYMBOLS_US = [symbol for symbol, _ in US_MEGACAPS]
+DEFAULT_SYMBOLS_EU = [symbol for symbol, _ in EU_MEGACAPS]
+DEFAULT_SYMBOLS = DEFAULT_SYMBOLS_US + DEFAULT_SYMBOLS_EU
+
+UNIVERSES = {
+    "all": DEFAULT_SYMBOLS,
+    "us": DEFAULT_SYMBOLS_US,
+    "eu": DEFAULT_SYMBOLS_EU,
+}
+
+
+def get_universe_symbols(universe: str = "all") -> list[str]:
+    """Return the default symbol list for a named universe ('all'|'us'|'eu')."""
+    try:
+        return list(UNIVERSES[universe])
+    except KeyError:
+        raise ValueError(
+            f"Unknown universe '{universe}'. Available universes: {sorted(UNIVERSES)}"
+        ) from None
+
+
 DEFAULT_THRESHOLDS = [1, 2, 3, 4]
 DEFAULT_FEE_RATES = [0.0, 0.005, 0.01, 0.015]
 DEFAULT_STARTING_CASH = 1000.0
@@ -721,6 +743,7 @@ def run_backtest(
     fee_fixed: float = 0.0,
     slippage_bps: float = 0.0,
     broker_preset: str | None = None,
+    universe: str = "all",
 ) -> pd.DataFrame:
     """
     Runs backtest_symbol() across a list of symbols (default: the curated
@@ -744,41 +767,35 @@ def run_backtest(
 
     broker_preset applies indicative broker costs with precedence:
     explicit fee_rates/fee_fixed/slippage_bps override preset values.
+
+    universe ('all'|'us'|'eu') selects the default symbol list when symbols
+    is not provided; an explicit symbols list always wins.
     """
     # Resolve broker preset with precedence: explicit args override preset
     fee_rates_resolved = fee_rates
     fee_fixed_resolved = fee_fixed
     slippage_bps_resolved = slippage_bps
     if broker_preset is not None:
-        # Determine if user passed explicit values (non-default)
-        explicit_fee_pct = fee_rates is not None
-        explicit_fee_fixed = fee_fixed != 0.0
-        explicit_slippage = slippage_bps != 0.0
-        # For fee_rates, if None use defaults later; treat as explicit only if passed
-        preset_fee_pct = None if explicit_fee_pct else None
-        preset_fee_fixed = None if explicit_fee_fixed else None
-        preset_slippage = None if explicit_slippage else None
-        # Better: pass None for non-explicit to let resolver use preset
-        p_fee_pct = None if fee_rates is None else fee_rates[0] if isinstance(fee_rates, (list, tuple)) and len(fee_rates) > 0 else (fee_rates if not isinstance(fee_rates, (list, tuple)) else None)
-        # Simpler approach: resolve per-value
+        # Only non-default explicit values override the preset.
+        if isinstance(fee_rates, (list, tuple)):
+            explicit_fee_pct = fee_rates[0] if fee_rates else None
+        elif isinstance(fee_rates, (int, float)) and not isinstance(fee_rates, bool):
+            explicit_fee_pct = float(fee_rates)
+        else:
+            explicit_fee_pct = None
         resolved_fee_pct_single, resolved_fee_fixed, resolved_slippage_bps, _label = resolve_broker_preset(
             broker_preset,
-            fee_rates[0] if isinstance(fee_rates, (list, tuple)) and len(fee_rates) > 0 else (fee_rates if isinstance(fee_rates, (int, float)) and not isinstance(fee_rates, bool) else None),
+            explicit_fee_pct,
             fee_fixed if fee_fixed != 0.0 else None,
             slippage_bps if slippage_bps != 0.0 else None,
         )
+        # A preset supplies a single fee rate; an explicit list stays authoritative.
         if fee_rates is None:
             fee_rates_resolved = [resolved_fee_pct_single]
-        else:
-            fee_rates_resolved = fee_rates
         fee_fixed_resolved = resolved_fee_fixed
         slippage_bps_resolved = resolved_slippage_bps
-    else:
-        fee_rates_resolved = fee_rates
-        fee_fixed_resolved = fee_fixed
-        slippage_bps_resolved = slippage_bps
 
-    symbols = symbols or DEFAULT_SYMBOLS
+    symbols = symbols or get_universe_symbols(universe)
     end = end or datetime.now()
     start = start or (end - timedelta(days=60))
 

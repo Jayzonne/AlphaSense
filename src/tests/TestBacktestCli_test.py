@@ -350,5 +350,45 @@ class TestVolatilityTargetCli(unittest.TestCase):
         self.assertEqual(kwargs["fee_fixed"], 0.0)
 
 
+class TestUniverseCli(unittest.TestCase):
+    def _run_main(self, argv: list[str]):
+        captured = {}
+
+        def fake_run_backtest(**kwargs):
+            captured.update(kwargs)
+            return _symbol_df(include_benchmark=False)
+
+        with patch.object(cli, "run_backtest", side_effect=fake_run_backtest), \
+             patch.object(sys, "argv", ["backtest.py", *argv]):
+            out = _capture(cli.main)
+        return out, captured
+
+    def test_universe_us_selects_us_symbols_and_is_announced(self):
+        from AlphaSense.analysis.backtest import DEFAULT_SYMBOLS_US
+
+        out, kwargs = self._run_main(["--universe", "us"])
+        self.assertEqual(kwargs["symbols"], DEFAULT_SYMBOLS_US)
+        self.assertIn("universe=us", out)
+
+    def test_universe_eu_selects_eu_symbols_and_is_announced(self):
+        from AlphaSense.analysis.backtest import DEFAULT_SYMBOLS_EU
+
+        out, kwargs = self._run_main(["--universe", "eu"])
+        self.assertEqual(kwargs["symbols"], DEFAULT_SYMBOLS_EU)
+        self.assertIn("universe=eu", out)
+
+    def test_default_universe_is_all_and_not_announced(self):
+        from AlphaSense.analysis.backtest import DEFAULT_SYMBOLS
+
+        out, kwargs = self._run_main([])
+        self.assertEqual(kwargs["symbols"], DEFAULT_SYMBOLS)
+        self.assertNotIn("universe=", out)
+
+    def test_explicit_symbols_override_universe(self):
+        out, kwargs = self._run_main(["--symbols", "AAPL", "--universe", "eu"])
+        self.assertEqual(kwargs["symbols"], ["AAPL"])
+        self.assertNotIn("universe=", out)
+
+
 if __name__ == "__main__":
     unittest.main()
