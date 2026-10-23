@@ -1,9 +1,19 @@
 import unittest
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 
-from AlphaSense.analysis.backtest import BacktestResult, simulate_wallet
+from AlphaSense.analysis.backtest import (
+    BacktestResult,
+    _vol_target_fraction_series,
+    backtest_symbol,
+    buy_and_hold_equity_curve,
+    buy_and_hold_value,
+    run_backtest,
+    simulate_wallet,
+    simulate_wallet_with_equity,
+)
 from AlphaSense.analysis.confluence import compute_confluence
 from AlphaSense.analysis.signals import (
     ConfluenceProvider,
@@ -163,6 +173,195 @@ class TestSimulateWallet(unittest.TestCase):
         high_fee, _ = simulate_wallet(df, confluence, threshold=2, fee_rate=0.015, starting_cash=1000.0, direction="short")
         self.assertGreater(no_fee, low_fee)
         self.assertGreater(low_fee, high_fee)
+
+
+class TestVolatilityTargetedSizing(unittest.TestCase):
+    @staticmethod
+    def _volatile_candles(n: int = 80, seed: int = 7, daily_vol: float = 0.02) -> pd.DataFrame:
+        """Deterministic pseudo-random walk with roughly `daily_vol` log returns."""
+        rng = np.random.default_rng(seed)
+        prices = [100.0]
+        for _ in range(n - 1):
+            prices.append(prices[-1] * float(np.exp(rng.normal(0.0, daily_vol))))
+        return _candles(prices)
+
+    def test_identical_calls_are_deterministic(self):
+        df = self._volatile_candles()
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 30, bearish=3))
+        kwargs = dict(
+            threshold=1, fee_rate=0.01, starting_cash=1000.0, direction="reverse",
+            target_vol=0.10, vol_lookback=10, bars_per_year=252,
+        )
+        cash_a, trades_a, equity_a = simulate_wallet_with_equity(df, confluence, **kwargs)
+        cash_b, trades_b, equity_b = simulate_wallet_with_equity(df, confluence, **kwargs)
+
+        self.assertEqual(cash_a, cash_b)
+        self.assertEqual(
+            [(t.action, t.time, t.price, t.fee_paid) for t in trades_a],
+            [(t.action, t.time, t.price, t.fee_paid) for t in trades_b],
+        )
+        pd.testing.assert_series_equal(equity_a, equity_b)
+
+    def test_fraction_is_clamped_between_zero_and_one(self):
+        df = self._volatile_candles()
+        for target_vol in (0.0, 0.001, 0.10, 1000.0):
+            with self.subTest(target_vol=target_vol):
+                fractions = _vol_target_fraction_series(df, target_vol, 20, 252)
+                self.assertEqual(len(fractions), len(df))
+                self.assertTrue((fractions >= 0.0).all())
+                self.assertTrue((fractions <= 1.0).all())
+
+    def test_incomplete_window_falls_back_to_one(self):
+        df = self._volatile_candles()
+        lookback = 20
+        fractions = _vol_target_fraction_series(df, 0.10, lookback, 252)
+        self.assertTrue((fractions.iloc[:lookback] == 1.0).all())
+
+    def test_fraction_has_no_lookahead(self):
+        # Identical through bar k, divergent afterwards: the fractions up to
+        # and including k must be identical, and truncating after k must not
+        # change fraction.iloc[k].
+        prices = [100.0 * (1.0 + 0.01 * ((-1) ** i)) for i in range(40)]
+        k = 25
+        prices_a = prices
+        prices_b = prices[: k + 1] + [prices[k] * (1.0 + 0.05 * i) for i in range(1, len(prices) - k)]
+        df_a, df_b = _candles(prices_a), _candles(prices_b)
+
+        fractions_a = _vol_target_fraction_series(df_a, 0.10, 5, 252)
+        fractions_b = _vol_target_fraction_series(df_b, 0.10, 5, 252)
+        pd.testing.assert_series_equal(fractions_a.iloc[: k + 1], fractions_b.iloc[: k + 1])
+
+        truncated = _vol_target_fraction_series(df_a.iloc[: k + 1], 0.10, 5, 252)
+        self.assertEqual(truncated.iloc[k], fractions_a.iloc[k])
+
+    def test_very_high_target_matches_disabled_sizing_exactly(self):
+        df = self._volatile_candles()
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 30, bearish=3))
+
+        base = simulate_wallet_with_equity(
+            df, confluence, threshold=1, fee_rate=0.01, starting_cash=1000.0,
+            direction="reverse", target_vol=None,
+        )
+        high = simulate_wallet_with_equity(
+            df, confluence, threshold=1, fee_rate=0.01, starting_cash=1000.0,
+            direction="reverse", target_vol=1000.0, vol_lookback=20, bars_per_year=252,
+        )
+
+        self.assertEqual(base[0], high[0])
+        self.assertEqual(
+            [(t.action, t.time, t.price, t.fee_paid) for t in base[1]],
+            [(t.action, t.time, t.price, t.fee_paid) for t in high[1]],
+        )
+        pd.testing.assert_series_equal(base[2], high[2])
+
+    def test_low_target_reduces_exposure_and_keeps_cash(self):
+        df = self._volatile_candles()
+        confluence = _confluence_at(df, 25, bullish=3)
+        starting_cash = 1000.0
+
+        cash, trades, _ = simulate_wallet_with_equity(
+            df, confluence, threshold=1, fee_rate=0.0, starting_cash=starting_cash,
+            target_vol=0.001, vol_lookback=20, bars_per_year=252,
+        )
+
+        fraction = float(_vol_target_fraction_series(df, 0.001, 20, 252).iloc[25])
+        self.assertLess(fraction, 1.0)
+        self.assertGreater(fraction, 0.0)
+        notional = fraction * starting_cash
+        self.assertLess(notional, starting_cash)
+        self.assertGreater(cash, 0.0)
+        self.assertEqual([t.action for t in trades], ["BUY", "SELL (liquidated at end)"])
+
+    def test_fees_are_charged_on_the_deployed_notional(self):
+        df = self._volatile_candles()
+        confluence = _confluence_at(df, 25, bullish=3)
+        starting_cash = 1000.0
+        fee_rate = 0.01
+
+        # A different open than close at the execution bar makes the share
+        # count observable through the mark-to-market equity point.
+        df = df.copy()
+        execution_bar = 26
+        df.iloc[execution_bar, df.columns.get_loc("open")] = 150.0
+
+        _, trades, equity = simulate_wallet_with_equity(
+            df, confluence, threshold=1, fee_rate=fee_rate, starting_cash=starting_cash,
+            target_vol=0.05, vol_lookback=20, bars_per_year=252,
+        )
+
+        fraction = float(_vol_target_fraction_series(df, 0.05, 20, 252).iloc[25])
+        notional = fraction * starting_cash
+        expected_fee = notional * fee_rate
+        expected_shares = (notional - expected_fee) / 150.0
+        expected_equity = (starting_cash - notional) + expected_shares * float(
+            df["close"].iloc[execution_bar]
+        )
+
+        self.assertAlmostEqual(trades[0].fee_paid, expected_fee, places=10)
+        self.assertAlmostEqual(trades[0].price, 150.0)
+        self.assertAlmostEqual(equity.iloc[execution_bar], expected_equity, places=8)
+
+    def test_residual_cash_is_preserved_when_a_long_is_sold(self):
+        df = self._volatile_candles()
+        confluence = _confluence_at(df, 25, bullish=3)
+        confluence.update(_confluence_at(df, 40, bearish=3))
+        starting_cash = 1000.0
+
+        cash, _, _ = simulate_wallet_with_equity(
+            df, confluence, threshold=1, fee_rate=0.0, starting_cash=starting_cash,
+            target_vol=0.05, vol_lookback=20, bars_per_year=252,
+        )
+
+        entry_fraction = float(_vol_target_fraction_series(df, 0.05, 20, 252).iloc[25])
+        entry_notional = entry_fraction * starting_cash
+        entry_price = float(df["open"].iloc[26])
+        exit_price = float(df["open"].iloc[41])
+        shares = entry_notional / entry_price
+        residual_cash = starting_cash - entry_notional
+
+        # The uninvested residual stays in the wallet (earning 0%); only the
+        # shares' P&L is added on the exit.
+        self.assertGreater(residual_cash, 0.0)
+        self.assertAlmostEqual(cash, residual_cash + shares * exit_price, places=8)
+
+    def test_target_vol_requires_bars_per_year(self):
+        df = self._volatile_candles()
+        with self.assertRaises(ValueError):
+            _vol_target_fraction_series(df, 0.10, 20, None)
+
+    def test_zero_fraction_does_not_open_a_position(self):
+        df = self._volatile_candles()
+        confluence = _confluence_at(df, 25, bullish=3)
+
+        cash, trades, equity = simulate_wallet_with_equity(
+            df, confluence, threshold=1, fee_rate=0.0, starting_cash=1000.0,
+            target_vol=0.0, vol_lookback=20, bars_per_year=252,
+        )
+
+        self.assertEqual(trades, [])
+        self.assertEqual(cash, 1000.0)
+        self.assertTrue((equity == 1000.0).all())
+
+    def test_simulate_wallet_keeps_its_two_tuple_with_target_vol_disabled(self):
+        df = self._volatile_candles()
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 30, bearish=3))
+
+        result = simulate_wallet(
+            df, confluence, threshold=1, fee_rate=0.01, starting_cash=1000.0,
+            target_vol=None, bars_per_year=252,
+        )
+        full = simulate_wallet_with_equity(
+            df, confluence, threshold=1, fee_rate=0.01, starting_cash=1000.0,
+            target_vol=None, bars_per_year=252,
+        )
+
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], full[0])
+        self.assertEqual(result[1], full[1])
 
 
 class TestSimulateWalletReverse(unittest.TestCase):
@@ -372,6 +571,400 @@ class TestRunBacktestErrorHandling(unittest.TestCase):
         directions = set(df["direction"].dropna())
         self.assertEqual(directions, {"long", "short"})
         self.assertTrue(all(df["error"].isna()))
+
+
+class TestBuyAndHoldBenchmark(unittest.TestCase):
+    def test_zero_fee_benchmark_return_matches_last_close_over_first_open(self):
+        df = _candles([100, 50, 120])
+        value = buy_and_hold_value(df, fee_rate=0.0, starting_cash=1000.0)
+        # First open = 100, last close = 120 -> +20%.
+        self.assertAlmostEqual(value, 1200.0)
+        self.assertAlmostEqual(value / 1000.0 - 1, 120 / 100 - 1)
+
+    def test_fees_are_applied_on_both_legs(self):
+        df = _candles([100, 50, 120])
+        value = buy_and_hold_value(df, fee_rate=0.01, starting_cash=1000.0)
+        # entry_fee = 10, shares = 990/100 = 9.9, gross = 1188.0,
+        # exit_fee = 11.88, value = 1176.12.
+        self.assertAlmostEqual(value, 1176.12, places=2)
+
+    def test_beats_benchmark_is_strict_greater_than(self):
+        tie = BacktestResult(
+            symbol="TEST", threshold=1, fee_rate=0.0, starting_cash=1000.0,
+            final_value=1100.0, benchmark_final_value=1100.0,
+        )
+        self.assertFalse(tie.beats_benchmark)
+        self.assertAlmostEqual(tie.benchmark_return_pct, 10.0)
+
+        ahead = BacktestResult(
+            symbol="TEST", threshold=1, fee_rate=0.0, starting_cash=1000.0,
+            final_value=1100.01, benchmark_final_value=1100.0,
+        )
+        self.assertTrue(ahead.beats_benchmark)
+
+        no_benchmark = BacktestResult(
+            symbol="TEST", threshold=1, fee_rate=0.0, starting_cash=1000.0, final_value=1100.0,
+        )
+        self.assertIsNone(no_benchmark.beats_benchmark)
+        self.assertIsNone(no_benchmark.benchmark_return_pct)
+
+    def test_backtest_symbol_attaches_the_same_benchmark_to_long_and_short(self):
+        from unittest.mock import patch
+
+        df = _candles([99, 100, 99, 120, 121])
+        fixed = _confluence_at(df, 0, bullish=3)
+        fixed.update(_confluence_at(df, 2, bearish=3))
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_benchmark_fixed", lambda **kwargs: FixedSignalProvider())
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[2], fee_rates=[0.01], direction="both",
+                signal_provider="test_benchmark_fixed",
+            )
+
+        by_direction = {r.direction: r for r in results}
+        expected = buy_and_hold_value(df, 0.01, 1000.0)
+        self.assertEqual(set(by_direction), {"long", "short"})
+        self.assertAlmostEqual(by_direction["long"].benchmark_final_value, expected)
+        self.assertAlmostEqual(by_direction["short"].benchmark_final_value, expected)
+
+    def test_run_backtest_exposes_benchmark_columns_on_normal_rows(self):
+        from unittest.mock import patch
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe") as mock_df, \
+             patch("AlphaSense.analysis.backtest.compute_confluence") as mock_conf:
+            mock_df.return_value = pd.DataFrame({
+                "open": [100, 101, 102, 103, 104],
+                "high": [101, 102, 103, 104, 105],
+                "low": [99, 100, 101, 102, 103],
+                "close": [100, 101, 102, 103, 104],
+            }, index=pd.date_range("2026-01-01", periods=5, freq="h"))
+            mock_conf.return_value = {"confluence": {}}
+
+            df = run_backtest(symbols=["TEST"], thresholds=[1], fee_rates=[0.0])
+
+        self.assertIn("benchmark_return_pct", df.columns)
+        self.assertIn("beats_benchmark", df.columns)
+        self.assertTrue(df["benchmark_return_pct"].notna().all())
+        self.assertTrue(df["beats_benchmark"].notna().all())
+        # Open 100 -> close 104 with no fees: +4%.
+        self.assertAlmostEqual(df.iloc[0]["benchmark_return_pct"], 4.0)
+
+
+class TestBenchmarkEquityAndMetrics(unittest.TestCase):
+    def test_curve_has_one_point_per_bar_and_ends_at_buy_and_hold_value(self):
+        df = _candles([100, 50, 120])
+        for fee_rate in (0.0, 0.01):
+            with self.subTest(fee_rate=fee_rate):
+                curve = buy_and_hold_equity_curve(df, fee_rate, 1000.0)
+                self.assertEqual(len(curve), len(df))
+                self.assertEqual(list(curve.index), list(df.index))
+                self.assertAlmostEqual(
+                    curve.iloc[-1], buy_and_hold_value(df, fee_rate, 1000.0), places=9
+                )
+
+    def test_curve_applies_fees_on_both_legs(self):
+        df = _candles([100, 50, 120])
+        curve = buy_and_hold_equity_curve(df, 0.01, 1000.0)
+        # Entry fee is baked into the share count: 990 / 100 = 9.9 shares,
+        # so the first mark-to-market point is 9.9 * 100 = 990 (the fee does
+        # not appear again as a return).
+        self.assertAlmostEqual(curve.iloc[0], 990.0, places=2)
+        self.assertAlmostEqual(curve.iloc[1], 495.0, places=2)  # 9.9 * 50
+        # Exit fee on the final close: 9.9 * 120 = 1188 gross, * 0.99 = 1176.12.
+        self.assertAlmostEqual(curve.iloc[-1], 1176.12, places=2)
+
+    def test_empty_frame_returns_an_empty_float_series(self):
+        curve = buy_and_hold_equity_curve(_candles([]), 0.01, 1000.0)
+        self.assertTrue(curve.empty)
+        self.assertEqual(curve.dtype, float)
+
+    def test_backtest_symbol_reuses_the_same_benchmark_metrics_for_all_rows(self):
+        from unittest.mock import patch
+
+        df = _candles([99, 100, 99, 80, 90, 120, 121])
+        fixed = _confluence_at(df, 0, bullish=3)
+        fixed.update(_confluence_at(df, 2, bearish=3))
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_benchmark_metrics_fixed", lambda **kwargs: FixedSignalProvider())
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[1, 2], fee_rates=[0.0], direction="both",
+                signal_provider="test_benchmark_metrics_fixed",
+            )
+
+        # 2 directions x 2 thresholds = 4 rows, all sharing the fee-0 benchmark.
+        self.assertEqual(len(results), 4)
+        tuples = {
+            (
+                r.benchmark_sharpe,
+                r.benchmark_sortino,
+                r.benchmark_max_drawdown_pct,
+                r.benchmark_calmar,
+            )
+            for r in results
+        }
+        self.assertEqual(len(tuples), 1)
+        sharpe, sortino, maxdd, calmar = next(iter(tuples))
+        for value in (sharpe, sortino, maxdd, calmar):
+            self.assertIsNotNone(value)
+
+    def test_run_backtest_exposes_benchmark_metric_columns_on_normal_rows(self):
+        from unittest.mock import patch
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe") as mock_df, \
+             patch("AlphaSense.analysis.backtest.compute_confluence") as mock_conf:
+            mock_df.return_value = pd.DataFrame({
+                "open": [100, 101, 99, 103, 104],
+                "high": [101, 102, 100, 104, 105],
+                "low": [99, 100, 98, 102, 103],
+                # A dip keeps the downside deviation non-zero (Sortino defined).
+                "close": [100, 101, 99, 103, 104],
+            }, index=pd.date_range("2026-01-01", periods=5, freq="h"))
+            mock_conf.return_value = {"confluence": {}}
+
+            df = run_backtest(symbols=["TEST"], thresholds=[1], fee_rates=[0.0])
+
+        for column in (
+            "benchmark_sharpe",
+            "benchmark_sortino",
+            "benchmark_max_drawdown_pct",
+            "benchmark_calmar",
+        ):
+            self.assertIn(column, df.columns)
+            self.assertTrue(df[column].notna().all(), column)
+
+    def test_unknown_interval_leaves_only_the_drawdown_defined(self):
+        from unittest.mock import patch
+
+        df = _candles([99, 100, 99, 80, 90, 120, 121])
+        fixed = _confluence_at(df, 0, bullish=3)
+        fixed.update(_confluence_at(df, 2, bearish=3))
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_benchmark_unknown_interval", lambda **kwargs: FixedSignalProvider())
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "7m",
+                thresholds=[2], fee_rates=[0.0], direction="long",
+                signal_provider="test_benchmark_unknown_interval",
+            )
+
+        result = results[0]
+        self.assertIsNone(result.benchmark_sharpe)
+        self.assertIsNone(result.benchmark_sortino)
+        self.assertIsNone(result.benchmark_calmar)
+        self.assertIsNotNone(result.benchmark_max_drawdown_pct)
+
+
+class TestEquityCurveAndMetrics(unittest.TestCase):
+    def test_curve_has_one_point_per_bar_and_starts_at_starting_cash(self):
+        df = _candles([100, 101, 102, 103, 104])
+        _, _, equity = simulate_wallet_with_equity(df, {}, threshold=1, fee_rate=0.0, starting_cash=1000.0)
+        self.assertEqual(len(equity), len(df))
+        self.assertEqual(list(equity.index), list(df.index))
+        self.assertEqual(equity.iloc[0], 1000.0)
+
+    def test_empty_and_single_bar_frames_do_not_crash(self):
+        for prices in ([], [100]):
+            with self.subTest(prices=prices):
+                df = _candles(prices)
+                cash, trades, equity = simulate_wallet_with_equity(
+                    df, {}, threshold=1, fee_rate=0.0, starting_cash=1000.0
+                )
+                self.assertEqual(len(equity), len(df))
+                self.assertEqual(trades, [])
+                self.assertEqual(cash, 1000.0)
+                if len(df):
+                    self.assertEqual(equity.iloc[0], 1000.0)
+
+    def test_last_equity_point_equals_final_value_for_every_direction(self):
+        cases = [
+            # Long, position closed before the end.
+            ([99, 100, 99, 120, 121], "long", [(0, "bullish"), (2, "bearish")], 0.0),
+            # Long, still open at the end -> liquidated at the last close.
+            ([99, 100, 105, 110, 130], "long", [(0, "bullish")], 0.01),
+            # Short, position covered before the end.
+            ([99, 100, 99, 80, 81], "short", [(0, "bearish"), (2, "bullish")], 0.0),
+            # Short, still open at the end -> covered at the last close.
+            ([99, 100, 105, 110, 130], "short", [(0, "bearish")], 0.01),
+            # Reverse, flips long -> short and ends short (liquidated).
+            ([99, 100, 99, 120, 121], "reverse", [(0, "bullish"), (2, "bearish")], 0.0),
+            # Reverse, no signal at all -> stays flat.
+            ([99, 100, 101, 102, 103], "reverse", [], 0.0),
+        ]
+        for prices, direction, signals, fee_rate in cases:
+            with self.subTest(direction=direction, prices=prices, fee_rate=fee_rate):
+                df = _candles(prices)
+                confluence = {}
+                for index, kind in signals:
+                    confluence.update(_confluence_at(df, index, **{kind: 3}))
+                final, _, equity = simulate_wallet_with_equity(
+                    df, confluence, threshold=2, fee_rate=fee_rate,
+                    starting_cash=1000.0, direction=direction,
+                )
+                self.assertEqual(len(equity), len(df))
+                self.assertAlmostEqual(equity.iloc[-1], final, places=10)
+
+    def test_simulate_wallet_keeps_its_two_tuple_contract(self):
+        df = _candles([99, 100, 99, 120, 121])
+        confluence = _confluence_at(df, 0, bullish=3)
+        confluence.update(_confluence_at(df, 2, bearish=3))
+
+        result = simulate_wallet(df, confluence, threshold=2, fee_rate=0.01, starting_cash=1000.0)
+        full = simulate_wallet_with_equity(df, confluence, threshold=2, fee_rate=0.01, starting_cash=1000.0)
+
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], full[0])
+        self.assertEqual(result[1], full[1])
+
+    def test_equity_does_not_look_ahead_of_the_current_bar(self):
+        # Both frames are identical through bar 4 and diverge afterwards; the
+        # second one also carries a future-only signal at bar 5. Equity up to
+        # and including bar 4 must be identical.
+        prices_a = [100, 101, 102, 103, 104, 105, 106, 107]
+        prices_b = [100, 101, 102, 103, 104, 50, 40, 30]
+        df_a, df_b = _candles(prices_a), _candles(prices_b)
+
+        confluence_a = _confluence_at(df_a, 0, bullish=3)
+        confluence_a.update(_confluence_at(df_a, 3, bearish=3))
+        confluence_b = _confluence_at(df_b, 0, bullish=3)
+        confluence_b.update(_confluence_at(df_b, 3, bearish=3))
+        confluence_b.update(_confluence_at(df_b, 5, bullish=3))  # only in the future
+
+        _, _, equity_a = simulate_wallet_with_equity(df_a, confluence_a, 2, 0.01, 1000.0)
+        _, _, equity_b = simulate_wallet_with_equity(df_b, confluence_b, 2, 0.01, 1000.0)
+
+        k = 4
+        pd.testing.assert_series_equal(equity_a.iloc[: k + 1], equity_b.iloc[: k + 1])
+
+    def test_backtest_result_exposes_risk_metrics_when_equity_is_available(self):
+        equity = pd.Series(
+            [1000.0, 1100.0, 990.0, 1089.0],
+            index=pd.date_range("2026-01-01", periods=4, freq="D"),
+        )
+        result = BacktestResult(
+            symbol="TEST", threshold=1, fee_rate=0.0, starting_cash=1000.0,
+            final_value=1089.0, equity_curve=equity, bars_per_year=252,
+        )
+        self.assertIsNotNone(result.sharpe)
+        self.assertIsNotNone(result.sortino)
+        self.assertIsNotNone(result.calmar)
+        self.assertAlmostEqual(result.max_drawdown_pct, 10.0)
+
+    def test_backtest_result_metrics_are_none_without_equity_or_annualization(self):
+        bare = BacktestResult(
+            symbol="TEST", threshold=1, fee_rate=0.0, starting_cash=1000.0, final_value=1000.0,
+        )
+        for name in ("sharpe", "sortino", "max_drawdown_pct", "calmar"):
+            with self.subTest(name=name):
+                self.assertIsNone(getattr(bare, name))
+
+        equity = pd.Series([1000.0, 1010.0, 1005.0], index=pd.date_range("2026-01-01", periods=3, freq="D"))
+        no_annualization = BacktestResult(
+            symbol="TEST", threshold=1, fee_rate=0.0, starting_cash=1000.0,
+            final_value=1005.0, equity_curve=equity,
+        )
+        for name in ("sharpe", "sortino", "calmar"):
+            with self.subTest(name=name):
+                self.assertIsNone(getattr(no_annualization, name))
+        self.assertIsNotNone(no_annualization.max_drawdown_pct)
+
+    def test_backtest_symbol_attaches_equity_and_bars_per_year(self):
+        from unittest.mock import patch
+
+        df = _candles([99, 100, 99, 80, 90, 120, 121])
+        fixed = _confluence_at(df, 0, bullish=3)
+        fixed.update(_confluence_at(df, 2, bearish=3))
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_equity_fixed", lambda **kwargs: FixedSignalProvider())
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "1h",
+                thresholds=[2], fee_rates=[0.0], direction="long",
+                signal_provider="test_equity_fixed",
+            )
+
+        result = results[0]
+        self.assertEqual(result.bars_per_year, 1638.0)
+        self.assertIsNotNone(result.equity_curve)
+        self.assertEqual(len(result.equity_curve), len(df))
+        self.assertAlmostEqual(result.equity_curve.iloc[-1], result.final_value)
+        self.assertIsNotNone(result.sharpe)
+        self.assertIsNotNone(result.max_drawdown_pct)
+
+    def test_backtest_symbol_unknown_interval_disables_annualized_metrics_only(self):
+        from unittest.mock import patch
+
+        df = _candles([99, 100, 99, 80, 90, 120, 121])
+        fixed = _confluence_at(df, 0, bullish=3)
+        fixed.update(_confluence_at(df, 2, bearish=3))
+
+        class FixedSignalProvider:
+            def build(self, price_df: pd.DataFrame) -> dict:
+                return fixed
+
+        register_provider("test_unknown_interval_fixed", lambda **kwargs: FixedSignalProvider())
+
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe", return_value=df):
+            results = backtest_symbol(
+                "TEST", df.index.min(), df.index.max(), "7m",
+                thresholds=[2], fee_rates=[0.0], direction="long",
+                signal_provider="test_unknown_interval_fixed",
+            )
+
+        result = results[0]
+        self.assertIsNone(result.bars_per_year)
+        self.assertIsNone(result.sharpe)
+        self.assertIsNone(result.calmar)
+        self.assertIsNotNone(result.equity_curve)
+
+    def test_run_backtest_fills_equity_out_and_keeps_the_dataframe_flat(self):
+        from unittest.mock import patch
+
+        eq_out = {}
+        with patch("AlphaSense.analysis.backtest.get_price_candles_dataframe") as mock_df, \
+             patch("AlphaSense.analysis.backtest.compute_confluence") as mock_conf:
+            mock_df.return_value = pd.DataFrame({
+                "open": [100, 101, 102, 103, 104],
+                "high": [101, 102, 103, 104, 105],
+                "low": [99, 100, 101, 102, 103],
+                "close": [100, 101, 102, 103, 104],
+            }, index=pd.date_range("2026-01-01", periods=5, freq="h"))
+            mock_conf.return_value = {"confluence": {}}
+
+            df = run_backtest(
+                symbols=["TEST"], thresholds=[1], fee_rates=[0.0], interval="1h",
+                equity_out=eq_out,
+            )
+
+        self.assertIn(("TEST", "long", 1, 0.0), eq_out)
+        self.assertEqual(len(eq_out[("TEST", "long", 1, 0.0)]), 5)
+        self.assertNotIn("equity_curve", df.columns)
+        for column in ("sharpe", "sortino", "max_drawdown_pct", "calmar"):
+            self.assertIn(column, df.columns)
 
 
 class TestSignalProviders(unittest.TestCase):

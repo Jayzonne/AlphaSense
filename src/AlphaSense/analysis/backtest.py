@@ -31,9 +31,11 @@ exactly breaking even counts as a loss, not a win.
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 
 from AlphaSense.frontend.data_access import get_price_candles_dataframe
+from AlphaSense.analysis import metrics
 from AlphaSense.analysis.confluence import compute_confluence
 from AlphaSense.analysis.signals import ConfluenceProvider, get_provider, register_provider
 from AlphaSense.requests.quotes import US_MEGACAPS, EU_MEGACAPS
@@ -66,10 +68,55 @@ class BacktestResult:
     final_value: float
     direction: str = "long"
     trades: list = field(default_factory=list)
+    benchmark_final_value: float | None = None
+    equity_curve: pd.Series | None = None
+    bars_per_year: float | None = None
+    benchmark_sharpe: float | None = None
+    benchmark_sortino: float | None = None
+    benchmark_max_drawdown_pct: float | None = None
+    benchmark_calmar: float | None = None
 
     @property
     def return_pct(self) -> float:
         return (self.final_value / self.starting_cash - 1) * 100
+
+    @property
+    def sharpe(self) -> float | None:
+        if self.equity_curve is None or self.bars_per_year is None:
+            return None
+        return metrics.sharpe_ratio(self.equity_curve.pct_change(), self.bars_per_year)
+
+    @property
+    def sortino(self) -> float | None:
+        if self.equity_curve is None or self.bars_per_year is None:
+            return None
+        return metrics.sortino_ratio(self.equity_curve.pct_change(), self.bars_per_year)
+
+    @property
+    def max_drawdown_pct(self) -> float | None:
+        if self.equity_curve is None:
+            return None
+        drawdown = metrics.max_drawdown(self.equity_curve)
+        return None if drawdown is None else drawdown * 100
+
+    @property
+    def calmar(self) -> float | None:
+        if self.equity_curve is None or self.bars_per_year is None:
+            return None
+        return metrics.calmar_ratio(self.equity_curve, self.bars_per_year)
+
+    @property
+    def benchmark_return_pct(self) -> float | None:
+        if self.benchmark_final_value is None:
+            return None
+        return (self.benchmark_final_value / self.starting_cash - 1) * 100
+
+    @property
+    def beats_benchmark(self) -> bool | None:
+        if self.benchmark_final_value is None:
+            return None
+        # Strict: a tie does NOT beat the benchmark.
+        return self.final_value > self.benchmark_final_value
 
     @property
     def num_round_trips(self) -> int:
@@ -87,6 +134,220 @@ class BacktestResult:
         return self.final_value > self.starting_cash
 
 
+def _vol_target_fraction_series(
+    price_df: pd.DataFrame,
+    target_vol: float | None,
+    vol_lookback: int,
+    bars_per_year: float | None,
+    fallback_fraction: float = 1.0,
+) -> pd.Series:
+    """
+    Per-bar fraction of the available cash to deploy, for volatility-targeted
+    position sizing.
+
+    target_vol is an ANNUALIZED volatility target expressed as a fraction
+    (0.10 = 10%). The realized volatility at bar i is the rolling standard
+    deviation of the log returns over the previous vol_lookback returns,
+    annualized with bars_per_year. The fraction is target_vol / realized_vol,
+    clamped to [0, 1]: this only ever REDUCES exposure (no leverage).
+
+    Bars where the window is not full yet, realized volatility is zero, or the
+    ratio is not finite fall back to fallback_fraction (1.0 by default, i.e.
+    the legacy fully-invested sizing).
+
+    target_vol=None disables the feature entirely and returns a constant 1.0
+    series, without requiring bars_per_year.
+
+    No lookahead: fraction.iloc[i] only uses close prices up to bar i (the
+    rolling window ends at i), so a signal computed from bar i cannot see any
+    future bar. The rolling window has min_periods=vol_lookback, hence the
+    first vol_lookback values are always the fallback.
+    """
+    if target_vol is None:
+        return pd.Series(1.0, index=price_df.index, dtype=float)
+    if bars_per_year is None:
+        raise ValueError("bars_per_year is required for volatility targeting (unknown interval)")
+    if vol_lookback < 2:
+        raise ValueError(f"vol_lookback must be >= 2, got {vol_lookback}")
+
+    closes = price_df["close"].astype(float)
+    log_returns = np.log(closes / closes.shift(1))
+    realized_vol = (
+        log_returns.rolling(window=vol_lookback, min_periods=vol_lookback).std(ddof=1)
+        * np.sqrt(bars_per_year)
+    )
+    fraction = target_vol / realized_vol
+    invalid = (~np.isfinite(fraction)) | (realized_vol <= 0)
+    fraction = fraction.where(~invalid, fallback_fraction)
+    return fraction.clip(lower=0.0, upper=1.0)
+
+
+def _simulate_wallet_full(
+    price_df: pd.DataFrame,
+    confluence: dict,
+    threshold: int,
+    fee_rate: float,
+    starting_cash: float,
+    direction: str = "long",
+    target_vol: float | None = None,
+    vol_lookback: int = 20,
+    fallback_fraction: float = 1.0,
+    bars_per_year: float | None = None,
+) -> tuple[float, list[Trade], pd.Series]:
+    """
+    Full simulation core: same trading rules as simulate_wallet(), plus the
+    mark-to-market equity curve.
+
+    Execution timing is unchanged: the signal computed from candle i is
+    executed at candle (i+1)'s open. equity[0] is the starting cash (no
+    execution can happen on the first bar), equity[t] is the wallet value
+    (cash + shares * close[t]) right after executing candle (t-1)'s signal at
+    candle t's open, and the final point is overwritten with the post-
+    liquidation cash so that equity[-1] == the returned final value exactly.
+
+    No point in the curve looks beyond its own bar, which keeps the existing
+    anti-lookahead guarantee intact.
+
+    target_vol (annualized fraction, e.g. 0.10 for 10%) opts into
+    volatility-targeted sizing: each entry deploys only
+    fraction * cash, where fraction is derived from the realized volatility
+    known at the signal bar. target_vol=None keeps the legacy fully-invested
+    sizing exactly (fraction == 1.0 everywhere).
+    """
+    if direction not in ("long", "short", "reverse"):
+        raise ValueError(f"direction must be 'long', 'short' or 'reverse', got {direction!r}")
+
+    # Computed once for the whole run; fraction.iloc[i] is the sizing to use
+    # for a signal computed from bar i (executed at bar i+1's open).
+    fractions = _vol_target_fraction_series(
+        price_df, target_vol, vol_lookback, bars_per_year, fallback_fraction
+    )
+
+    times = list(price_df.index)
+    cash = starting_cash
+    shares = 0.0  # positive = long, negative = short
+    trades: list[Trade] = []
+    equity_values: list[float] = []
+
+    if times:
+        # Bar 0: no signal has been actionable yet, so the wallet is untouched.
+        equity_values.append(float(starting_cash))
+
+        # For each bar t >= 1, act on the signal from bar t-1 at bar t's open,
+        # then mark the resulting wallet to bar t's close.
+        for t in range(1, len(times)):
+            i = t - 1
+            conf = confluence.get(pd.Timestamp(times[i]).isoformat())
+            if conf is not None:
+                execution_price = float(price_df["open"].iloc[i + 1])
+                execution_time = times[i + 1]
+                fraction = float(fractions.iloc[i])
+
+                if direction == "long":
+                    if shares == 0.0 and conf["bullish_count"] >= threshold and fraction > 0.0:
+                        notional = fraction * cash
+                        fee_paid = notional * fee_rate
+                        shares = (notional - fee_paid) / execution_price
+                        cash = cash - notional
+                        trades.append(Trade("BUY", execution_time, execution_price, fee_paid))
+                    elif shares > 0.0 and conf["bearish_count"] >= threshold:
+                        proceeds = shares * execution_price
+                        fee_paid = proceeds * fee_rate
+                        # Any cash left uninvested by volatility targeting stays
+                        # in the wallet. When fraction == 1.0, cash is already
+                        # 0 here, so this is exactly the legacy behaviour.
+                        cash = cash + proceeds - fee_paid
+                        shares = 0.0
+                        trades.append(Trade("SELL", execution_time, execution_price, fee_paid))
+                elif direction == "short":
+                    if shares == 0.0 and conf["bearish_count"] >= threshold and fraction > 0.0:
+                        # Sell short the fraction * cash worth of shares.
+                        # We receive the sale proceeds in cash and hold a negative share
+                        # position; fees are deducted from the proceeds.
+                        notional = fraction * cash
+                        fee_paid = notional * fee_rate
+                        shares = -notional / execution_price
+                        cash = cash + notional - fee_paid
+                        trades.append(Trade("SELL (short)", execution_time, execution_price, fee_paid))
+                    elif shares < 0.0 and conf["bullish_count"] >= threshold:
+                        # Buy to cover: repurchase shares to close the short position.
+                        cover_cost = (-shares) * execution_price
+                        fee_paid = cover_cost * fee_rate
+                        cash = cash - cover_cost - fee_paid
+                        shares = 0.0
+                        trades.append(Trade("BUY (cover)", execution_time, execution_price, fee_paid))
+                else:  # direction == "reverse"
+                    if shares == 0.0 and conf["bullish_count"] >= threshold and fraction > 0.0:
+                        # Flat + bullish: go long, same sizing as the "long" direction.
+                        notional = fraction * cash
+                        fee_paid = notional * fee_rate
+                        shares = (notional - fee_paid) / execution_price
+                        cash = cash - notional
+                        trades.append(Trade("BUY", execution_time, execution_price, fee_paid))
+                    elif shares == 0.0 and conf["bearish_count"] >= threshold and fraction > 0.0:
+                        # Flat + bearish: go short, same sizing as the "short" direction.
+                        notional = fraction * cash
+                        fee_paid = notional * fee_rate
+                        shares = -notional / execution_price
+                        cash = cash + notional - fee_paid
+                        trades.append(Trade("SELL (short)", execution_time, execution_price, fee_paid))
+                    elif shares > 0.0 and conf["bearish_count"] >= threshold:
+                        # Long + bearish: sell the long position, then immediately sell
+                        # short with fraction * the resulting cash - both at the same
+                        # execution price. A zero fraction liquidates and stays flat,
+                        # without appending a zero-size entry trade.
+                        proceeds = shares * execution_price
+                        sell_fee_paid = proceeds * fee_rate
+                        cash = cash + proceeds - sell_fee_paid
+                        shares = 0.0
+                        trades.append(Trade("SELL", execution_time, execution_price, sell_fee_paid))
+
+                        if fraction > 0.0:
+                            notional = fraction * cash
+                            short_fee_paid = notional * fee_rate
+                            shares = -notional / execution_price
+                            cash = cash + notional - short_fee_paid
+                            trades.append(Trade("SELL (short)", execution_time, execution_price, short_fee_paid))
+                    elif shares < 0.0 and conf["bullish_count"] >= threshold:
+                        # Short + bullish: cover the short position, then immediately
+                        # buy long with fraction * the resulting cash - both at the
+                        # same execution price. A zero fraction covers and stays flat,
+                        # without appending a zero-size entry trade.
+                        cover_cost = (-shares) * execution_price
+                        cover_fee_paid = cover_cost * fee_rate
+                        cash = cash - cover_cost - cover_fee_paid
+                        shares = 0.0
+                        trades.append(Trade("BUY (cover)", execution_time, execution_price, cover_fee_paid))
+
+                        if fraction > 0.0:
+                            notional = fraction * cash
+                            buy_fee_paid = notional * fee_rate
+                            shares = (notional - buy_fee_paid) / execution_price
+                            cash = cash - notional
+                            trades.append(Trade("BUY", execution_time, execution_price, buy_fee_paid))
+
+            equity_values.append(cash + shares * float(price_df["close"].iloc[t]))
+
+        if shares > 0.0:
+            last_price = float(price_df["close"].iloc[-1])
+            proceeds = shares * last_price
+            fee_paid = proceeds * fee_rate
+            cash = cash + proceeds - fee_paid
+            trades.append(Trade("SELL (liquidated at end)", times[-1], last_price, fee_paid))
+        elif shares < 0.0:
+            last_price = float(price_df["close"].iloc[-1])
+            cover_cost = (-shares) * last_price
+            fee_paid = cover_cost * fee_rate
+            cash = cash - cover_cost - fee_paid
+            trades.append(Trade("BUY (cover liquidated at end)", times[-1], last_price, fee_paid))
+
+        # The run ends fully in cash: make the last curve point exact.
+        equity_values[-1] = cash
+
+    equity = pd.Series(equity_values, index=price_df.index, dtype=float)
+    return cash, trades, equity
+
+
 def simulate_wallet(
     price_df: pd.DataFrame,
     confluence: dict,
@@ -94,6 +355,10 @@ def simulate_wallet(
     fee_rate: float,
     starting_cash: float = DEFAULT_STARTING_CASH,
     direction: str = "long",
+    target_vol: float | None = None,
+    vol_lookback: int = 20,
+    fallback_fraction: float = 1.0,
+    bars_per_year: float | None = None,
 ) -> tuple[float, list[Trade]]:
     """
     Pure simulation core (no I/O, fully deterministic given its inputs - the
@@ -118,110 +383,95 @@ def simulate_wallet(
 
     Fractional shares are allowed (this simulates dollar-value wallet
     performance, not literal whole-share broker execution).
+
+    target_vol/vol_lookback/fallback_fraction/bars_per_year opt into
+    volatility-targeted sizing (see _vol_target_fraction_series); leaving
+    target_vol=None keeps the exact legacy behaviour.
     """
-    if direction not in ("long", "short", "reverse"):
-        raise ValueError(f"direction must be 'long', 'short' or 'reverse', got {direction!r}")
-
-    times = list(price_df.index)
-    cash = starting_cash
-    shares = 0.0  # positive = long, negative = short
-    trades: list[Trade] = []
-
-    # range(len(times) - 1): the final candle's own signal can never be acted
-    # on, since there's no "next candle" left to execute at - an unavoidable
-    # edge of any window-bounded backtest, not a bug.
-    for i in range(len(times) - 1):
-        conf = confluence.get(pd.Timestamp(times[i]).isoformat())
-        if conf is None:
-            continue
-        execution_price = float(price_df["open"].iloc[i + 1])
-        execution_time = times[i + 1]
-
-        if direction == "long":
-            if shares == 0.0 and conf["bullish_count"] >= threshold:
-                fee_paid = cash * fee_rate
-                shares = (cash - fee_paid) / execution_price
-                cash = 0.0
-                trades.append(Trade("BUY", execution_time, execution_price, fee_paid))
-            elif shares > 0.0 and conf["bearish_count"] >= threshold:
-                proceeds = shares * execution_price
-                fee_paid = proceeds * fee_rate
-                cash = proceeds - fee_paid
-                shares = 0.0
-                trades.append(Trade("SELL", execution_time, execution_price, fee_paid))
-        elif direction == "short":
-            if shares == 0.0 and conf["bearish_count"] >= threshold:
-                # Sell short the equivalent of the available cash worth of shares.
-                # We receive the sale proceeds in cash and hold a negative share
-                # position; fees are deducted from the proceeds.
-                fee_paid = cash * fee_rate
-                short_value = cash  # notional value sold short
-                shares = -short_value / execution_price
-                cash = cash + short_value - fee_paid
-                trades.append(Trade("SELL (short)", execution_time, execution_price, fee_paid))
-            elif shares < 0.0 and conf["bullish_count"] >= threshold:
-                # Buy to cover: repurchase shares to close the short position.
-                cover_cost = (-shares) * execution_price
-                fee_paid = cover_cost * fee_rate
-                cash = cash - cover_cost - fee_paid
-                shares = 0.0
-                trades.append(Trade("BUY (cover)", execution_time, execution_price, fee_paid))
-        else:  # direction == "reverse"
-            if shares == 0.0 and conf["bullish_count"] >= threshold:
-                # Flat + bullish: go long, same sizing as the "long" direction.
-                fee_paid = cash * fee_rate
-                shares = (cash - fee_paid) / execution_price
-                cash = 0.0
-                trades.append(Trade("BUY", execution_time, execution_price, fee_paid))
-            elif shares == 0.0 and conf["bearish_count"] >= threshold:
-                # Flat + bearish: go short, same sizing as the "short" direction.
-                fee_paid = cash * fee_rate
-                short_value = cash  # notional value sold short
-                shares = -short_value / execution_price
-                cash = cash + short_value - fee_paid
-                trades.append(Trade("SELL (short)", execution_time, execution_price, fee_paid))
-            elif shares > 0.0 and conf["bearish_count"] >= threshold:
-                # Long + bearish: sell the long position, then immediately sell
-                # short with the resulting cash - both at the same execution price.
-                proceeds = shares * execution_price
-                sell_fee_paid = proceeds * fee_rate
-                cash = proceeds - sell_fee_paid
-                shares = 0.0
-                trades.append(Trade("SELL", execution_time, execution_price, sell_fee_paid))
-
-                short_fee_paid = cash * fee_rate
-                short_value = cash  # notional value sold short
-                shares = -short_value / execution_price
-                cash = cash + short_value - short_fee_paid
-                trades.append(Trade("SELL (short)", execution_time, execution_price, short_fee_paid))
-            elif shares < 0.0 and conf["bullish_count"] >= threshold:
-                # Short + bullish: cover the short position, then immediately
-                # buy long with the resulting cash - both at the same execution price.
-                cover_cost = (-shares) * execution_price
-                cover_fee_paid = cover_cost * fee_rate
-                cash = cash - cover_cost - cover_fee_paid
-                shares = 0.0
-                trades.append(Trade("BUY (cover)", execution_time, execution_price, cover_fee_paid))
-
-                buy_fee_paid = cash * fee_rate
-                shares = (cash - buy_fee_paid) / execution_price
-                cash = 0.0
-                trades.append(Trade("BUY", execution_time, execution_price, buy_fee_paid))
-
-    if shares > 0.0:
-        last_price = float(price_df["close"].iloc[-1])
-        proceeds = shares * last_price
-        fee_paid = proceeds * fee_rate
-        cash = proceeds - fee_paid
-        trades.append(Trade("SELL (liquidated at end)", times[-1], last_price, fee_paid))
-    elif shares < 0.0:
-        last_price = float(price_df["close"].iloc[-1])
-        cover_cost = (-shares) * last_price
-        fee_paid = cover_cost * fee_rate
-        cash = cash - cover_cost - fee_paid
-        trades.append(Trade("BUY (cover liquidated at end)", times[-1], last_price, fee_paid))
-
+    cash, trades, _ = _simulate_wallet_full(
+        price_df, confluence, threshold, fee_rate, starting_cash, direction,
+        target_vol=target_vol, vol_lookback=vol_lookback,
+        fallback_fraction=fallback_fraction, bars_per_year=bars_per_year,
+    )
     return cash, trades
+
+
+def simulate_wallet_with_equity(
+    price_df: pd.DataFrame,
+    confluence: dict,
+    threshold: int,
+    fee_rate: float,
+    starting_cash: float = DEFAULT_STARTING_CASH,
+    direction: str = "long",
+    target_vol: float | None = None,
+    vol_lookback: int = 20,
+    fallback_fraction: float = 1.0,
+    bars_per_year: float | None = None,
+) -> tuple[float, list[Trade], pd.Series]:
+    """
+    Same signature and trading rules as simulate_wallet(), but also returns
+    the mark-to-market equity curve (one point per candle, indexed by the
+    price DataFrame's index). See _simulate_wallet_full() for the exact
+    contract; equity.iloc[-1] equals the returned final cash value.
+    """
+    return _simulate_wallet_full(
+        price_df, confluence, threshold, fee_rate, starting_cash, direction,
+        target_vol=target_vol, vol_lookback=vol_lookback,
+        fallback_fraction=fallback_fraction, bars_per_year=bars_per_year,
+    )
+
+
+def buy_and_hold_value(
+    price_df: pd.DataFrame,
+    fee_rate: float,
+    starting_cash: float = DEFAULT_STARTING_CASH,
+) -> float:
+    """
+    Passive long buy-and-hold: buy at the first bar's OPEN, value/sell at the
+    last bar's CLOSE, with the SAME fee assumptions as simulate_wallet
+    (entry fee on the notional, exit fee on the proceeds).
+
+    This is the benchmark a strategy must beat: it only depends on the bars
+    and the fee rate, never on a threshold or direction.
+    """
+    entry_price = float(price_df["open"].iloc[0])
+    exit_price = float(price_df["close"].iloc[-1])
+    entry_fee = starting_cash * fee_rate
+    shares = (starting_cash - entry_fee) / entry_price
+    gross = shares * exit_price
+    exit_fee = gross * fee_rate
+    return gross - exit_fee
+
+
+def buy_and_hold_equity_curve(
+    price_df: pd.DataFrame,
+    fee_rate: float,
+    starting_cash: float = DEFAULT_STARTING_CASH,
+) -> pd.Series:
+    """
+    Passive long buy-and-hold equity curve: one mark-to-market point per bar,
+    valued at that bar's CLOSE, with the same fee assumptions as
+    buy_and_hold_value().
+
+    The entry fee is folded into the initial position: only
+    (starting_cash - entry_fee) is invested at the first bar's OPEN, so the
+    shares bought are already reduced by it and the entry fee does not show up
+    again in the returns of the returned series. The exit fee is applied only
+    to the final point, exactly where a passive holder would sell.
+
+    Invariants: len(curve) == len(price_df) (same index), and the final point
+    equals buy_and_hold_value(price_df, fee_rate, starting_cash). An empty
+    price frame yields an empty float Series rather than an error.
+    """
+    if price_df.empty:
+        return pd.Series(dtype=float)
+
+    entry_price = float(price_df["open"].iloc[0])
+    entry_fee = starting_cash * fee_rate
+    shares = (starting_cash - entry_fee) / entry_price
+    equity = shares * price_df["close"].astype(float)
+    equity.iloc[-1] = equity.iloc[-1] * (1 - fee_rate)
+    return equity
 
 
 def backtest_symbol(
@@ -235,6 +485,8 @@ def backtest_symbol(
     direction: str = "long",
     signal_provider: str = DEFAULT_SIGNAL_PROVIDER,
     provider_kwargs: dict | None = None,
+    target_vol: float | None = None,
+    vol_lookback: int = 20,
 ) -> list[BacktestResult]:
     """
     Fetches price data and computes the selected signal ONCE for this symbol,
@@ -272,13 +524,58 @@ def backtest_symbol(
     )
     confluence = provider.build(df)
 
+    # Annualization only matters for the risk metrics; an unusual interval
+    # must not abort an otherwise valid backtest.
+    try:
+        bars_per_year = metrics.annualization_factor(interval)
+    except ValueError:
+        bars_per_year = None
+
+    # The passive benchmark depends only on the (sorted) bars and the fee
+    # rate - not on threshold or direction - so compute its value and its risk
+    # metrics once per fee, then reuse them for every result row.
+    benchmark_by_fee = {
+        fee_rate: buy_and_hold_value(df, fee_rate, starting_cash) for fee_rate in fee_rates
+    }
+    benchmark_curve_by_fee = {
+        fee_rate: buy_and_hold_equity_curve(df, fee_rate, starting_cash) for fee_rate in fee_rates
+    }
+    benchmark_metrics_by_fee = {}
+    for fee_rate, curve in benchmark_curve_by_fee.items():
+        bench_returns = curve.pct_change()
+        bench_max_drawdown = metrics.max_drawdown(curve)
+        benchmark_metrics_by_fee[fee_rate] = {
+            "benchmark_sharpe": (
+                None if bars_per_year is None else metrics.sharpe_ratio(bench_returns, bars_per_year)
+            ),
+            "benchmark_sortino": (
+                None if bars_per_year is None else metrics.sortino_ratio(bench_returns, bars_per_year)
+            ),
+            "benchmark_max_drawdown_pct": (
+                None if bench_max_drawdown is None else bench_max_drawdown * 100
+            ),
+            "benchmark_calmar": (
+                None if bars_per_year is None else metrics.calmar_ratio(curve, bars_per_year)
+            ),
+        }
+
     results = []
     directions = ("long", "short") if direction == "both" else (direction,)
     for dir_ in directions:
         for threshold in thresholds:
             for fee_rate in fee_rates:
-                final_value, trades = simulate_wallet(df, confluence, threshold, fee_rate, starting_cash, dir_)
-                results.append(BacktestResult(symbol, threshold, fee_rate, starting_cash, final_value, dir_, trades))
+                final_value, trades, equity = simulate_wallet_with_equity(
+                    df, confluence, threshold, fee_rate, starting_cash, dir_,
+                    target_vol=target_vol, vol_lookback=vol_lookback,
+                    bars_per_year=bars_per_year,
+                )
+                results.append(BacktestResult(
+                    symbol, threshold, fee_rate, starting_cash, final_value, dir_, trades,
+                    benchmark_final_value=benchmark_by_fee[fee_rate],
+                    equity_curve=equity,
+                    bars_per_year=bars_per_year,
+                    **benchmark_metrics_by_fee[fee_rate],
+                ))
     return results
 
 
@@ -293,6 +590,9 @@ def run_backtest(
     direction: str = "long",
     signal_provider: str = DEFAULT_SIGNAL_PROVIDER,
     provider_kwargs: dict | None = None,
+    equity_out: dict | None = None,
+    target_vol: float | None = None,
+    vol_lookback: int = 20,
 ) -> pd.DataFrame:
     """
     Runs backtest_symbol() across a list of symbols (default: the curated
@@ -300,6 +600,10 @@ def run_backtest(
 
     provider_kwargs is passed through unchanged to every backtest_symbol()
     call, so all symbols in a run use the same provider configuration.
+
+    equity_out (optional) is filled in-place with the per-run equity curves,
+    keyed by (symbol, direction, threshold, fee_pct). The curves are kept out
+    of the returned DataFrame, which stays flat and cheap to aggregate.
     """
     symbols = symbols or DEFAULT_SYMBOLS
     end = end or datetime.now()
@@ -311,6 +615,7 @@ def run_backtest(
             results = backtest_symbol(
                 symbol, start, end, interval, thresholds, fee_rates, starting_cash, direction,
                 signal_provider, provider_kwargs,
+                target_vol=target_vol, vol_lookback=vol_lookback,
             )
         except Exception as e:
             rows.append({"symbol": symbol, "threshold": None, "fee_pct": None, "direction": None, "error": str(e)})
@@ -319,6 +624,8 @@ def run_backtest(
             rows.append({"symbol": symbol, "threshold": None, "fee_pct": None, "direction": None, "error": "no data / too few candles"})
             continue
         for r in results:
+            if equity_out is not None:
+                equity_out[(r.symbol, r.direction, r.threshold, round(r.fee_rate * 100, 2))] = r.equity_curve
             rows.append({
                 "symbol": r.symbol,
                 "threshold": r.threshold,
@@ -326,6 +633,18 @@ def run_backtest(
                 "direction": r.direction,
                 "final_value": round(r.final_value, 2),
                 "return_pct": round(r.return_pct, 2),
+                "benchmark_return_pct": None if r.benchmark_return_pct is None else round(r.benchmark_return_pct, 2),
+                "beats_benchmark": r.beats_benchmark,
+                "sharpe": None if r.sharpe is None else round(r.sharpe, 2),
+                "sortino": None if r.sortino is None else round(r.sortino, 2),
+                "max_drawdown_pct": None if r.max_drawdown_pct is None else round(r.max_drawdown_pct, 2),
+                "calmar": None if r.calmar is None else round(r.calmar, 2),
+                "benchmark_sharpe": None if r.benchmark_sharpe is None else round(r.benchmark_sharpe, 2),
+                "benchmark_sortino": None if r.benchmark_sortino is None else round(r.benchmark_sortino, 2),
+                "benchmark_max_drawdown_pct": (
+                    None if r.benchmark_max_drawdown_pct is None else round(r.benchmark_max_drawdown_pct, 2)
+                ),
+                "benchmark_calmar": None if r.benchmark_calmar is None else round(r.benchmark_calmar, 2),
                 "num_trades": r.num_round_trips,
                 "win": r.is_win,
                 "error": None,

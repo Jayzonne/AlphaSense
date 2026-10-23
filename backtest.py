@@ -50,11 +50,37 @@ def _print_symbol_table(symbol: str, symbol_df: pd.DataFrame) -> None:
         if dir_df.empty:
             continue
         print(f"\n--- {direction.upper()} ---")
+        # The passive buy-and-hold benchmark is direction-independent, so it is
+        # safe to print it in every direction block. Older/error-only DataFrames
+        # may not carry the column (or carry only NaNs): in that case stay
+        # silent rather than crashing or printing "nan".
+        if "benchmark_return_pct" in dir_df.columns and dir_df["benchmark_return_pct"].notna().any():
+            pivot_bench = dir_df.pivot(index="threshold", columns="fee_pct", values="benchmark_return_pct")
+            bench_parts = []
+            for fee in pivot_bench.columns:
+                values = pivot_bench[fee].dropna()
+                if values.empty:
+                    continue
+                bench_parts.append(f"Fee {fee:g}% = {values.iloc[0]:+.2f}%")
+            if bench_parts:
+                print("buy & hold: " + " | ".join(bench_parts))
         pivot_return = dir_df.pivot(index="threshold", columns="fee_pct", values="return_pct")
         pivot_trades = dir_df.pivot(index="threshold", columns="fee_pct", values="num_trades")
         pivot_win = dir_df.pivot(index="threshold", columns="fee_pct", values="win")
 
-        col_width = 18
+        # Only widen the cells when the risk metrics actually carry data;
+        # older/partial frames keep the exact original 18-char layout.
+        has_metrics = (
+            "max_drawdown_pct" in dir_df.columns
+            and "sharpe" in dir_df.columns
+            and dir_df["max_drawdown_pct"].notna().any()
+            and dir_df["sharpe"].notna().any()
+        )
+        if has_metrics:
+            pivot_mdd = dir_df.pivot(index="threshold", columns="fee_pct", values="max_drawdown_pct")
+            pivot_sharpe = dir_df.pivot(index="threshold", columns="fee_pct", values="sharpe")
+
+        col_width = 30 if has_metrics else 18
         # Cast to int explicitly for display: when other symbols in the same run
         # produced an error row (threshold=None), pandas upcasts the WHOLE
         # threshold/fee_pct columns to float64 across the entire combined
@@ -69,7 +95,15 @@ def _print_symbol_table(symbol: str, symbol_df: pd.DataFrame) -> None:
                 ret = pivot_return.loc[threshold, fee]
                 trades = int(pivot_trades.loc[threshold, fee])
                 tag = "WIN " if pivot_win.loc[threshold, fee] else "LOSS"
-                cells.append(f"{tag} {ret:+.2f}% ({trades}t)".rjust(col_width))
+                if has_metrics:
+                    mdd = pivot_mdd.loc[threshold, fee]
+                    sharpe = pivot_sharpe.loc[threshold, fee]
+                    mdd_text = "n/a" if pd.isna(mdd) else f"{mdd:.1f}%"
+                    sharpe_text = "n/a" if pd.isna(sharpe) else f"{sharpe:.2f}"
+                    cell = f"{tag} {ret:+.2f}% ({trades}t) DD {mdd_text} SR {sharpe_text}"
+                else:
+                    cell = f"{tag} {ret:+.2f}% ({trades}t)"
+                cells.append(cell.rjust(col_width))
             print(f"{int(threshold):>9} | " + " | ".join(cells))
 
 
@@ -80,13 +114,76 @@ def _print_aggregate_summary(results: pd.DataFrame) -> None:
         return
     print("\n=== Aggregate across all symbols (win rate = share of symbols profitable net of fees) ===")
     group_cols = ["direction", "threshold", "fee_pct"] if "direction" in valid.columns and valid["direction"].notna().any() else ["threshold", "fee_pct"]
-    summary = valid.groupby(group_cols).agg(
-        win_rate_pct=("win", lambda s: round(s.mean() * 100, 1)),
-        avg_return_pct=("return_pct", lambda s: round(s.mean(), 2)),
-        symbols_tested=("win", "size"),
-    ).reset_index()
+    aggregations = {
+        "win_rate_pct": ("win", lambda s: round(s.mean() * 100, 1)),
+        "avg_return_pct": ("return_pct", lambda s: round(s.mean(), 2)),
+    }
+    if "beats_benchmark" in valid.columns and valid["beats_benchmark"].notna().any():
+        aggregations["beat_rate_pct"] = (
+            "beats_benchmark",
+            lambda s: round(s.dropna().astype(bool).mean() * 100, 1),
+        )
+    aggregations["symbols_tested"] = ("win", "size")
+    # Risk metrics are optional too: only surface the averages when at least
+    # one numeric value exists, leaving frames without the columns untouched.
+    for column, name in (
+        ("sharpe", "avg_sharpe"),
+        ("sortino", "avg_sortino"),
+        ("max_drawdown_pct", "avg_maxdd_pct"),
+        ("calmar", "avg_calmar"),
+    ):
+        if column in valid.columns and valid[column].notna().any():
+            aggregations[name] = (
+                column,
+                lambda s: round(pd.to_numeric(s, errors="coerce").dropna().mean(), 2),
+            )
+    summary = valid.groupby(group_cols).agg(**aggregations).reset_index()
     if "threshold" in summary.columns:
         summary["threshold"] = summary["threshold"].astype(int)  # same float-upcast reason as _print_symbol_table
+    print(summary.to_string(index=False))
+
+
+def _print_benchmark_summary(results: pd.DataFrame) -> None:
+    """
+    Print the passive buy-and-hold benchmark aggregated BY FEE RATE only, with
+    both its return and its risk metrics.
+
+    The benchmark is independent of direction and threshold, so duplicated
+    rows for the same (symbol, fee_pct) are collapsed before aggregating -
+    otherwise a run with several directions/thresholds would weight some
+    symbols more heavily than others. Older/partial result frames (missing the
+    benchmark columns, or carrying only benchmark_return_pct) print nothing or
+    a reduced table rather than crashing.
+    """
+    if "benchmark_return_pct" not in results.columns:
+        return
+    valid = results[results["error"].isna()]
+    if valid.empty:
+        return
+    if valid["benchmark_return_pct"].notna().sum() == 0:
+        return
+
+    # One observation per symbol and fee: the benchmark does not depend on
+    # direction or threshold, so those duplicates must not skew the averages.
+    bench = valid.drop_duplicates(subset=["symbol", "fee_pct"])
+
+    aggregations = {}
+    for column, name in (
+        ("benchmark_return_pct", "avg_benchmark_pct"),
+        ("benchmark_sharpe", "avg_benchmark_sharpe"),
+        ("benchmark_sortino", "avg_benchmark_sortino"),
+        ("benchmark_max_drawdown_pct", "avg_benchmark_maxdd_pct"),
+        ("benchmark_calmar", "avg_benchmark_calmar"),
+    ):
+        if column in bench.columns and bench[column].notna().any():
+            aggregations[name] = (
+                column,
+                lambda s: round(pd.to_numeric(s, errors="coerce").dropna().mean(), 2),
+            )
+    aggregations["symbols_tested"] = ("symbol", "nunique")
+
+    summary = bench.groupby("fee_pct").agg(**aggregations).reset_index()
+    print("\n=== Benchmark (buy & hold) across all symbols ===")
     print(summary.to_string(index=False))
 
 
@@ -120,6 +217,10 @@ def main():
                         help="TSMOM lookback windows in bars, e.g. 21 63 252 "
                              "(default: 21 63 252 = 1/3/12 months at 1d); only used with "
                              "--signal-provider tsmom")
+    parser.add_argument("--target-vol", type=float, default=None,
+                        help="Annualized volatility target in percent, e.g. 10 (disabled by default)")
+    parser.add_argument("--vol-lookback", type=int, default=20,
+                        help="Rolling window in bars for realized volatility (default: 20)")
     args = parser.parse_args()
 
     if args.preset:
@@ -131,9 +232,15 @@ def main():
 
     fee_rates = [f / 100 for f in args.fees] if args.fees else DEFAULT_FEE_RATES
     symbols = args.symbols or DEFAULT_SYMBOLS
+    target_vol = None if args.target_vol is None else args.target_vol / 100.0
 
-    print(f"Backtesting {len(symbols)} symbol(s), {start.date()} to {end.date()}, interval={interval}, "
-          f"starting cash=${args.starting_cash:.2f}, direction={args.direction}")
+    header = (
+        f"Backtesting {len(symbols)} symbol(s), {start.date()} to {end.date()}, interval={interval}, "
+        f"starting cash=${args.starting_cash:.2f}, direction={args.direction}"
+    )
+    if target_vol is not None:
+        header += f", target_vol={args.target_vol:.1f}% vol_lookback={args.vol_lookback}"
+    print(header)
 
     # Only tsmom understands --lookbacks. Gating here (rather than making every
     # provider factory swallow unknown kwargs) keeps each factory's signature
@@ -146,12 +253,14 @@ def main():
         thresholds=args.thresholds, fee_rates=fee_rates, starting_cash=args.starting_cash,
         direction=args.direction, signal_provider=args.signal_provider,
         provider_kwargs=provider_kwargs,
+        target_vol=target_vol, vol_lookback=args.vol_lookback,
     )
 
     for symbol in results["symbol"].unique():
         _print_symbol_table(symbol, results[results["symbol"] == symbol])
 
     _print_aggregate_summary(results)
+    _print_benchmark_summary(results)
 
 
 if __name__ == "__main__":
